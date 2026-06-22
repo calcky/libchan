@@ -1,0 +1,23 @@
+add_executable(bench_throughput bench_throughput.c)
+target_include_directories(bench_throughput PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(bench_throughput PRIVATE chan_static Threads::Threads)
+target_compile_definitions(bench_throughput PRIVATE _GNU_SOURCE)
+target_compile_options(bench_throughput PRIVATE -O3)
+
+add_executable(bench_lock_overhead bench_lock_overhead.c)
+target_include_directories(bench_lock_overhead PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(bench_lock_overhead PRIVATE chan_static Threads::Threads)
+target_compile_definitions(bench_lock_overhead PRIVATE _GNU_SOURCE)
+target_compile_options(bench_lock_overhead PRIVATE -O3)
+
+add_executable(bench_mpmc bench_mpmc.c)
+target_include_directories(bench_mpmc PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(bench_mpmc PRIVATE chan_static Threads::Threads)
+target_compile_definitions(bench_mpmc PRIVATE _GNU_SOURCE)
+target_compile_options(bench_mpmc PRIVATE -O3)
+
+add_executable(bench_ring_cmp bench_ring_cmp.c)
+target_include_directories(bench_ring_cmp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_ring_cmp PRIVATE Threads::Threads)
+target_compile_definitions(bench_ring_cmp PRIVATE _GNU_SOURCE)
+target_compile_options(bench_ring_cmp PRIVATE -O3)

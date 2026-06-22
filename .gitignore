@@ -1,0 +1,25 @@
+# ── Build directories ───────────────────────────────────────────
+build*/
+Testing/
+
+# ── Compiled objects / libraries ────────────────────────────────
+*.o
+*.a
+*.so
+*.so.*
+
+# ── CMake artifacts ─────────────────────────────────────────────
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+
+# ── Cross-language benchmark binaries ───────────────────────────
+bench/crosslang/libchan/bench_c
+bench/crosslang/go/bench_go
+bench/crosslang/rust/target/
+
+# ── Editor / OS ─────────────────────────────────────────────────
+.vscode/
+*.swp
+core
+*.core

@@ -1,0 +1,62 @@
+/*
+ * ring_lf.h — DPDK rte_ring-style MPMC lock-free ring buffer
+ *
+ * Protocol (single-element enqueue):
+ *   Phase 1 — Reserve: CAS prod.head old→old+1.
+ *             Full check: (prod.head - cons.tail) >= capacity → return false.
+ *   Phase 2 — Write:   copy data into slots[(old_head & mask) * elem_size].
+ *   Phase 3 — Commit:  spin until prod.tail == old_head,
+ *                       then store_release(prod.tail, old_head+1).
+ *
+ * Protocol (single-element dequeue) is symmetric using cons.head/cons.tail.
+ *
+ * The acquire-load of prod.tail in dequeue Phase 1 synchronises with the
+ * producer's release-store of prod.tail, so the data is visible before it
+ * is read.  No additional fence is required between Phase 1 and Phase 2.
+ *
+ * Capacity is rounded up to the next power of 2 at init time.
+ * uint32_t indices wrap naturally at 2^32; the unsigned subtraction
+ * used for full/empty checks is always correct.
+ */
+#ifndef RING_LF_H
+#define RING_LF_H
+
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define RING_LF_CACHELINE 64
+#define RING_LF_ALIGNED   __attribute__((aligned(RING_LF_CACHELINE)))
+
+typedef struct {
+    /* Producer cursors — one cache line */
+    struct {
+        _Atomic uint32_t head;   /* reserved-up-to by producers */
+        _Atomic uint32_t tail;   /* committed-up-to by producers (visible to consumers) */
+    } prod RING_LF_ALIGNED;
+
+    /* Consumer cursors — separate cache line */
+    struct {
+        _Atomic uint32_t head;   /* reserved-up-to by consumers */
+        _Atomic uint32_t tail;   /* committed-up-to by consumers (visible to producers) */
+    } cons RING_LF_ALIGNED;
+
+    uint32_t  mask;       /* capacity - 1; index via [idx & mask] */
+    uint32_t  capacity;   /* actual allocated capacity, always a power of 2 */
+    size_t    elem_size;
+    char     *slots;      /* capacity * elem_size bytes */
+} chan_ring_lf_t;
+
+/* Initialise ring.  cap is rounded up to next power of 2 internally. */
+bool ring_lf_init   (chan_ring_lf_t *r, size_t cap, size_t elem_size);
+void ring_lf_destroy(chan_ring_lf_t *r);
+
+/* Returns true on success; false if full (push) or empty (pop). */
+bool ring_lf_push(chan_ring_lf_t *r, const void *data);
+bool ring_lf_pop (chan_ring_lf_t *r, void *out);
+
+/* Approximate count of committed items not yet reserved by consumers. */
+uint32_t ring_lf_count(const chan_ring_lf_t *r);
+
+#endif /* RING_LF_H */
