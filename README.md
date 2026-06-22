@@ -200,6 +200,7 @@ libchan/
 |------|------|
 | [getting_started.md](doc/getting_started.md) | 构建与上手 |
 | [api_reference.md](doc/api_reference.md) | 完整 API 参考 |
+| [architecture.md](doc/architecture.md) | 工作原理图解（分层 / 快慢路径 / rendezvous 时序） |
 | [design.md](doc/design.md) | 内部架构与并发设计 |
 | [benchmarks.md](doc/benchmarks.md) | 内部基准方法与数据 |
 | [comparison.md](doc/comparison.md) | 与 Go / Rust 的跨语言对比 |
