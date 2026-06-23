@@ -200,6 +200,43 @@ static inline void waitq_close_all(chan_waitq_t *q) {
     }
 }
 
+/* ---- Lost-wakeup recovery (buffered channels) ----
+ *
+ * A lock-free fast-path op and a slow-path waiter registration race at the
+ * channel boundary: a sender may push to the ring after a receiver checked the
+ * ring empty but before the receiver's recv_waiter_cnt store is visible, so the
+ * sender skips waking and the receiver parks on data it never sees (and vice
+ * versa for a full ring).  The fast paths pair a seq_cst fence with these
+ * helpers: after a successful push/pop, if the opposite waiter count is
+ * non-zero, hand parked waiters the buffered data and wake them.  Best-effort
+ * and FIFO-preserving (oldest ring slot to the next receiver). */
+static inline void chan_deliver_ring_to_receivers(struct chan *ch) {
+    chan_lock(&ch->lock);
+    while (!ring_empty(ch)) {
+        chan_waiter_t *r = waitq_pop_receiver(&ch->recv_waiters);
+        if (!r) break;
+        if (!ring_pop(ch, r->data)) {       /* lost the slot to a racing pop */
+            waitq_push_front(&ch->recv_waiters, r);
+            break;
+        }
+        r->result = CHAN_OK;
+        chan_park_wake(r->wake_park);
+    }
+    chan_unlock(&ch->lock);
+}
+
+static inline void chan_admit_senders_to_ring(struct chan *ch) {
+    chan_lock(&ch->lock);
+    while (!ring_full(ch)) {
+        chan_waiter_t *s = waitq_pop_sender(&ch->send_waiters);
+        if (!s) break;
+        if (!ring_push(ch, s->data)) { waitq_push_front(&ch->send_waiters, s); break; }
+        s->result = CHAN_OK;
+        chan_park_wake(s->wake_park);
+    }
+    chan_unlock(&ch->lock);
+}
+
 /* Internal entry points */
 chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns);
 chan_err_t chan_recv_impl(chan_t *ch, void *out,        int64_t timeout_ns);

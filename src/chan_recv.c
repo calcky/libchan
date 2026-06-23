@@ -13,8 +13,16 @@ chan_err_t chan_recv_impl(chan_t *ch, void *out, int64_t timeout_ns) {
     if (ch->capacity > 0 &&
         atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) == 0 &&
         atomic_load_explicit(&ch->recv_waiter_cnt, memory_order_relaxed) == 0) {
-        if (ring_lf_pop(&ch->ring, out))
+        if (ring_lf_pop(&ch->ring, out)) {
+            /* We freed a ring slot.  A sender may have registered & parked
+             * (ring was full) in the lock-free window.  Pair a seq_cst fence
+             * with the sender's seq_cst registration so we never both miss:
+             * admit a parked sender into the slot we just freed. */
+            atomic_thread_fence(memory_order_seq_cst);
+            if (atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) != 0)
+                chan_admit_senders_to_ring(ch);
             return CHAN_OK;
+        }
         /* ring was empty — fall through; check closed inside lock */
     }
 
@@ -105,17 +113,32 @@ chan_err_t chan_recv_impl(chan_t *ch, void *out, int64_t timeout_ns) {
 
     chan_waiter_t self;
     waiter_init(&self, out, CHAN_OP_RECV);
-    atomic_fetch_add_explicit(&ch->recv_waiter_cnt, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ch->recv_waiter_cnt, 1, memory_order_seq_cst);
     waitq_push(&ch->recv_waiters, &self);
+
+    /* Re-check the ring after registering (still under lock): a lock-free
+     * sender may have pushed in the window before our count became visible.
+     * The seq_cst increment above pairs with the sender's seq_cst-fenced
+     * recheck so we never both miss — no lost wakeup. */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (ring_pop(ch, out)) {
+        waitq_remove(&ch->recv_waiters, &self);
+        atomic_fetch_sub_explicit(&ch->recv_waiter_cnt, 1, memory_order_relaxed);
+        chan_unlock(&ch->lock);
+        waiter_destroy(&self);
+        return CHAN_OK;
+    }
     chan_unlock(&ch->lock);
 
     if (!chan_park_wait(self.wake_park, timeout_ns)) {
         chan_lock(&ch->lock);
-        waitq_remove(&ch->recv_waiters, &self);
+        /* If we are still queued, nobody delivered → genuine timeout.
+         * If a sender already dequeued us, our data is in out → OK. */
+        bool still_queued = waitq_remove(&ch->recv_waiters, &self);
         chan_unlock(&ch->lock);
         atomic_fetch_sub_explicit(&ch->recv_waiter_cnt, 1, memory_order_relaxed);
         waiter_destroy(&self);
-        return CHAN_ERR_TIMEOUT;
+        return still_queued ? CHAN_ERR_TIMEOUT : self.result;
     }
     atomic_fetch_sub_explicit(&ch->recv_waiter_cnt, 1, memory_order_relaxed);
     waiter_destroy(&self);

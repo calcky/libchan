@@ -16,8 +16,16 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
         !atomic_load_explicit(&ch->closed, memory_order_acquire) &&
         atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) == 0 &&
         atomic_load_explicit(&ch->recv_waiter_cnt, memory_order_relaxed) == 0) {
-        if (ring_lf_push(&ch->ring, data))
+        if (ring_lf_push(&ch->ring, data)) {
+            /* A receiver may have registered & parked (ring was empty) in the
+             * lock-free window.  Pair a seq_cst fence with the receiver's
+             * seq_cst registration so we never both miss: hand the buffered
+             * data to a parked receiver and wake it. */
+            atomic_thread_fence(memory_order_seq_cst);
+            if (atomic_load_explicit(&ch->recv_waiter_cnt, memory_order_relaxed) != 0)
+                chan_deliver_ring_to_receivers(ch);
             return CHAN_OK;
+        }
         /* ring was full — fall through to slow path */
     }
 
@@ -69,7 +77,18 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
     if (!waitq_empty(&ch->recv_waiters)) {
         chan_waiter_t *r = waitq_pop_receiver(&ch->recv_waiters);
         if (r) {
-            memcpy(r->data, data, ch->elem_size);
+            /* Preserve FIFO: if the ring holds older items (a fast-path sender
+             * may have pushed after this receiver checked the ring empty but
+             * before registering), give the receiver the OLDEST item and queue
+             * our new data at the tail.  Handing the new item directly while
+             * older data sits in the ring would deliver out of order.
+             * ring_pop may fail (a slot we saw vanished to a racing pop); only
+             * swap when it actually yields an item, else hand off directly. */
+            if (!ring_empty(ch) && ring_pop(ch, r->data)) {
+                ring_push(ch, data);   /* slot just freed → succeeds */
+            } else {
+                memcpy(r->data, data, ch->elem_size);
+            }
             r->result = CHAN_OK;
             chan_unlock(&ch->lock);
             chan_park_wake(r->wake_park);
@@ -97,17 +116,32 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
 
     chan_waiter_t self;
     waiter_init(&self, (void *)data, CHAN_OP_SEND);
-    atomic_fetch_add_explicit(&ch->send_waiter_cnt, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ch->send_waiter_cnt, 1, memory_order_seq_cst);
     waitq_push(&ch->send_waiters, &self);
+
+    /* Re-check the ring after registering (still under lock): a lock-free
+     * receiver may have freed a slot before our count became visible.  The
+     * seq_cst increment above pairs with the receiver's seq_cst-fenced recheck
+     * so we never both miss — no lost wakeup. */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (ring_push(ch, data)) {
+        waitq_remove(&ch->send_waiters, &self);
+        atomic_fetch_sub_explicit(&ch->send_waiter_cnt, 1, memory_order_relaxed);
+        chan_unlock(&ch->lock);
+        waiter_destroy(&self);
+        return CHAN_OK;
+    }
     chan_unlock(&ch->lock);
 
     if (!chan_park_wait(self.wake_park, timeout_ns)) {
         chan_lock(&ch->lock);
-        waitq_remove(&ch->send_waiters, &self);
+        /* If we are still queued, nobody admitted us → genuine timeout.
+         * If an admitter already dequeued us, our data is in the ring → OK. */
+        bool still_queued = waitq_remove(&ch->send_waiters, &self);
         chan_unlock(&ch->lock);
         atomic_fetch_sub_explicit(&ch->send_waiter_cnt, 1, memory_order_relaxed);
         waiter_destroy(&self);
-        return CHAN_ERR_TIMEOUT;
+        return still_queued ? CHAN_ERR_TIMEOUT : self.result;
     }
     atomic_fetch_sub_explicit(&ch->send_waiter_cnt, 1, memory_order_relaxed);
     waiter_destroy(&self);
