@@ -1,4 +1,5 @@
-foreach(ex producer_consumer multi_recv_select multi_recv_fanin multi_recv_spin)
+foreach(ex producer_consumer multi_recv_select multi_recv_fanin multi_recv_spin
+           sieve_primes worker_pool select_cancel ping_pong ping_pong_buffered)
     add_executable(${ex} ${ex}.c)
     target_include_directories(${ex} PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_link_libraries(${ex} PRIVATE chan_static Threads::Threads)
