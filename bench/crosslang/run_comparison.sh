@@ -223,14 +223,14 @@ Go 的 goroutine park/unpark 完全在用户态 runtime 调度器内完成，无
 
 单生产单消费、缓冲未满/未空时，select 命中无锁 ring 快路径：
 `send_waiter_cnt==0 && recv_waiter_cnt==0` 时 `ring_lf_push/pop` 完全绕过 mutex。
-cap=1024 时 libchan 达 **~25 Mops/s（~40 ns/op）**，约为 Go 的 2 倍、crossbeam 的
-2.4 倍，直接体现 Vyukov ring 的 SPSC 无锁路径效率。
+cap=1024 时 libchan 约 **24 Mops/s（~40 ns/op）**，约为 Go 的 2 倍、crossbeam 的
+2.5 倍以上，直接体现 Vyukov ring 的 SPSC 无锁路径效率。
 
 ### S4–S6 — MPMC 扩展性：libchan 领先
 
 多生产多消费高竞争下，libchan 的 select 快路径仍绕过 mutex，仅在 CAS 层面竞争
-`prod.head`/`cons.head`。8P+8C（16 线程）时 libchan **9.28 Mops/s**，约为 Go 的
-3.2 倍、crossbeam 的 1.5 倍。Go 在高线程数下 goroutine 调度开销放大，吞吐反而下降。
+`prod.head`/`cons.head`。8P+8C（16 线程）时 libchan 约 **8–9 Mops/s**，约为 Go 的
+2.5–3 倍、且高于 crossbeam。Go 在高线程数下 goroutine 调度开销放大，吞吐反而下降。
 
 ---
 

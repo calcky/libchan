@@ -63,28 +63,33 @@ flowchart TB
 ## 2. send 快慢路径流程图
 
 核心机制：当**两个 waiter 计数都为 0**（无人阻塞）时，直接对无锁环做 `ring_lf_push`，
-完全绕过 mutex；否则取锁走慢路径，必要时注册等待者并 park。下图忠于 `chan_send_impl`
-（`src/chan_send.c`）。
+完全绕过 mutex；否则取锁走慢路径，必要时注册等待者并 park。注意快路径推送成功后会用
+一道 `seq_cst` fence 重查 `recv_waiter_cnt`，把数据交给在竞态窗口里刚 park 的接收者，
+避免丢唤醒。下图忠于 `chan_send_impl`（`src/chan_send.c`）。
 
 ```mermaid
 flowchart TD
     SA["chan_send(ch, data)"] --> SB{"cap>0 且未关闭<br/>且 send_waiter_cnt==0 且 recv_waiter_cnt==0?"}
     SB -->|是| SC["ring_lf_push 无锁入环"]
-    SC -->|成功| SOK["返回 CHAN_OK<br/>✓ 快路径，零锁"]
+    SC -->|成功| SW["seq_cst fence<br/>recv_waiter_cnt≠0 则唤醒 park 的接收者"]
+    SW --> SOK["返回 CHAN_OK<br/>✓ 快路径，零锁"]
     SC -->|环满| SL["取 ch->lock"]
     SB -->|否| SL
     SL --> SD{"已关闭?"}
     SD -->|是| SCLOSED["返回 CHAN_ERR_CLOSED"]
     SD -->|否| SE{"有等待的接收者?"}
-    SE -->|是| SF["直接交手：memcpy 到接收者<br/>+ chan_park_wake 唤醒"] --> SOK
+    SE -->|是| SF["FIFO 交手：环非空给最老的、新数据入环尾<br/>否则 memcpy；chan_park_wake 唤醒"] --> SOK
     SE -->|否| SG{"ring_push 成功?"}
     SG -->|是| SOK
-    SG -->|"否，环满"| SH["注册 send_waiter + 自增 send_waiter_cnt<br/>park 阻塞，被唤醒后返回 CHAN_OK"]
+    SG -->|"否，环满"| SH["注册 send_waiter（seq_cst）+ 重查 ring_push"]
+    SH --> SH2{"重查入环成功?"}
+    SH2 -->|是| SOK
+    SH2 -->|否| SP["park 阻塞，被唤醒后返回 CHAN_OK"]
 
     classDef fast fill:#d6f5d6,stroke:#2e7d32;
     classDef slow fill:#ffe0b2,stroke:#e65100;
-    class SC,SOK fast;
-    class SL,SH slow;
+    class SC,SW,SOK fast;
+    class SL,SH,SP slow;
 ```
 
 ---
@@ -92,13 +97,16 @@ flowchart TD
 ## 3. recv 快慢路径流程图
 
 对称地，无竞争时直接 `ring_lf_pop` 出环；否则取锁，依次尝试"取环中数据"、"与等待发送者
-rendezvous"，都不行则注册等待者 park。下图忠于 `chan_recv_impl`（`src/chan_recv.c`）。
+rendezvous"，都不行则注册等待者 park。同样地，快路径弹出后用 `seq_cst` fence 重查
+`send_waiter_cnt`，把刚腾出的空位让给 park 的发送者；注册后也会再查一次环才真正 park。
+下图忠于 `chan_recv_impl`（`src/chan_recv.c`）。
 
 ```mermaid
 flowchart TD
     RA["chan_recv(ch, out)"] --> RB{"cap>0 且<br/>send_waiter_cnt==0 且 recv_waiter_cnt==0?"}
     RB -->|是| RC["ring_lf_pop 无锁出环"]
-    RC -->|成功| ROK["返回 CHAN_OK<br/>✓ 快路径，零锁"]
+    RC -->|成功| RW["seq_cst fence<br/>send_waiter_cnt≠0 则放行 park 的发送者入环"]
+    RW --> ROK["返回 CHAN_OK<br/>✓ 快路径，零锁"]
     RC -->|环空| RL["取 ch->lock"]
     RB -->|否| RL
     RL --> RD{"环里有数据?"}
@@ -107,17 +115,25 @@ flowchart TD
     RF -->|是| RG["与发送者 rendezvous<br/>memcpy + 唤醒"] --> ROK
     RF -->|否| RH{"已关闭?"}
     RH -->|是| RCLOSED["返回 CHAN_ERR_CLOSED"]
-    RH -->|否| RI["注册 recv_waiter + 自增 recv_waiter_cnt<br/>park 阻塞，被唤醒后返回 CHAN_OK"]
+    RH -->|否| RI["注册 recv_waiter（seq_cst）+ 重查环"]
+    RI --> RI2{"重查 ring_pop 命中?"}
+    RI2 -->|是| ROK
+    RI2 -->|否| RP["park 阻塞，被唤醒后返回 CHAN_OK"]
 
     classDef fast fill:#d6f5d6,stroke:#2e7d32;
     classDef slow fill:#ffe0b2,stroke:#e65100;
-    class RC,ROK fast;
-    class RL,RI slow;
+    class RC,RW,ROK fast;
+    class RL,RI,RP slow;
 ```
 
 > **为什么用 waiter 计数当门槛**：只要有线程睡在 send/recv 队列里，所有线程就一律走
 > 加锁慢路径，保证"接收者帮发送者入环"等操作不会和并发的无锁 push 竞争。无竞争时
 > 计数全 0，快路径生效，这是 SPSC/MPMC 高吞吐的来源。
+>
+> **避免丢唤醒**：无锁快路径与"注册等待者"之间存在竞态窗口——快路径可能在接收者检查
+> 完环、但其计数尚未对发送者可见时推入数据，导致接收者抱着环里的数据永久 park。两侧各用
+> 一道 `seq_cst` fence 构成 StoreLoad（Dekker）屏障：要么等待者注册后重查时看到数据，
+> 要么快路径重查时看到计数并唤醒它，二者不会同时错过。
 
 ---
 

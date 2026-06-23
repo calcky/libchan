@@ -38,7 +38,7 @@ OS     : 6.6.87.2-microsoft-standard-WSL2
 C      : gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
 Go     : go1.23.10
 Rust   : 1.96.0
-Date   : 2026-06-22
+Date   : 2026-06-23
 ```
 
 ---
@@ -47,12 +47,12 @@ Date   : 2026-06-22
 
 | 场景                 |     libchan (C) |    Go chan |   crossbeam (Rust) |
 |----------------------|-----------------|------------|--------------------|
-| 1P+1C  cap=0 (unbuf)   |         0.235   |      4.748 |              0.150 |
-| 1P+1C  cap=64          |        14.436   |     12.548 |              5.227 |
-| 1P+1C  cap=1024        |        24.155   |     12.799 |              9.410 |
-| 2P+2C  cap=1024        |        12.885   |     10.734 |              9.873 |
-| 4P+4C  cap=1024        |        11.020   |      6.150 |              9.314 |
-| 8P+8C  cap=1024        |         9.620   |      3.238 |              6.053 |
+| 1P+1C  cap=0 (unbuf)   |         0.280   |      4.715 |              0.155 |
+| 1P+1C  cap=64          |        13.708   |     12.439 |              5.532 |
+| 1P+1C  cap=1024        |        24.445   |     12.956 |              9.079 |
+| 2P+2C  cap=1024        |        13.138   |     11.051 |              9.823 |
+| 4P+4C  cap=1024        |         9.905   |      6.127 |              9.096 |
+| 8P+8C  cap=1024        |         8.504   |      3.223 |              5.785 |
 
 
 ---
@@ -93,14 +93,14 @@ Go 的 goroutine park/unpark 完全在用户态 runtime 调度器内完成，无
 
 单生产单消费、缓冲未满/未空时，select 命中无锁 ring 快路径：
 `send_waiter_cnt==0 && recv_waiter_cnt==0` 时 `ring_lf_push/pop` 完全绕过 mutex。
-cap=1024 时 libchan 达 **~25 Mops/s（~40 ns/op）**，约为 Go 的 2 倍、crossbeam 的
-2.4 倍，直接体现 Vyukov ring 的 SPSC 无锁路径效率。
+cap=1024 时 libchan 约 **24 Mops/s（~40 ns/op）**，约为 Go 的 2 倍、crossbeam 的
+2.5 倍以上，直接体现 Vyukov ring 的 SPSC 无锁路径效率。
 
 ### S4–S6 — MPMC 扩展性：libchan 领先
 
 多生产多消费高竞争下，libchan 的 select 快路径仍绕过 mutex，仅在 CAS 层面竞争
-`prod.head`/`cons.head`。8P+8C（16 线程）时 libchan **9.28 Mops/s**，约为 Go 的
-3.2 倍、crossbeam 的 1.5 倍。Go 在高线程数下 goroutine 调度开销放大，吞吐反而下降。
+`prod.head`/`cons.head`。8P+8C（16 线程）时 libchan 约 **8–9 Mops/s**，约为 Go 的
+2.5–3 倍、且高于 crossbeam。Go 在高线程数下 goroutine 调度开销放大，吞吐反而下降。
 
 ---
 
