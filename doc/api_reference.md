@@ -292,6 +292,8 @@ int chan_select(chan_select_case_t *cases, size_t n);
 
 **锁顺序保证**：内部按 channel 指针地址升序加锁，所有并发 select 调用不会因锁顺序不一致而死锁。
 
+> **已知限制（有缓冲通道）**：park 在有缓冲通道上的 select 等待者，不会被该通道上的无锁快路径 send/recv 及时唤醒——它在环填满/取空到有线程改走慢路径、或通道被 `chan_close` 时才被唤醒。持续流量下这只是批处理延迟；但若生产者发少量数据后**永久沉默且不 close**，park 的 select 消费者可能一直收不到。**规避**：用 `chan_close` 表示发送完毕（close 必定唤醒所有 park 的 select）。直连 `chan_send`/`chan_recv` 不受此限制。详见 [`design.md`](design.md) 的 Select 小节。
+
 ---
 
 ### `chan_select_try`
