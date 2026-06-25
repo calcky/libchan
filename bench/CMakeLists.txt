@@ -21,3 +21,9 @@ target_include_directories(bench_ring_cmp PRIVATE ${CMAKE_SOURCE_DIR}/include ${
 target_link_libraries(bench_ring_cmp PRIVATE Threads::Threads)
 target_compile_definitions(bench_ring_cmp PRIVATE _GNU_SOURCE)
 target_compile_options(bench_ring_cmp PRIVATE -O3)
+
+add_executable(bench_showcase bench_showcase.c)
+target_include_directories(bench_showcase PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_showcase PRIVATE chan_static Threads::Threads)
+target_compile_definitions(bench_showcase PRIVATE _GNU_SOURCE)
+target_compile_options(bench_showcase PRIVATE -O3)
