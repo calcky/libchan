@@ -104,48 +104,30 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
 
     /* ---- Buffered slow path ---- */
 
-    /* Direct hand-off if a receiver is waiting.
-     * Do NOT guard with ring_empty(): a fast-path sender may have pushed
-     * after the receiver checked the ring but before it incremented
-     * recv_waiter_cnt, leaving the ring non-empty yet the receiver sleeping. */
-    if (!waitq_empty(&ch->recv_waiters)) {
-        chan_waiter_t *r = waitq_pop_receiver(&ch->recv_waiters);
-        if (r) {
-            /* Preserve FIFO: if the ring holds older items (a fast-path sender
-             * may have pushed after this receiver checked the ring empty but
-             * before registering), give the receiver the OLDEST item and queue
-             * our new data at the tail.  Handing the new item directly while
-             * older data sits in the ring would deliver out of order.
-             * ring_pop may fail (a slot we saw vanished to a racing pop); only
-             * swap when it actually yields an item, else hand off directly. */
-            if (!ring_empty(ch) && ring_pop(ch, r->data)) {
-                ring_push(ch, data);   /* slot just freed → succeeds */
-            } else {
-                memcpy(r->data, data, ch->elem_size);
-            }
-            r->result = CHAN_OK;
-            chan_unlock(&ch->lock);
-            chan_park_wake(r->wake_park);
-            return CHAN_OK;
-        }
-    }
-
     /*
-     * Try to push into the ring under the lock.
+     * Buffer our data at the tail (if there is room), then hand buffered items
+     * to any parked receivers in FIFO order (oldest first) and wake them.
      *
-     * Safety: when send_waiter_cnt or recv_waiter_cnt is non-zero, no thread
-     * uses the lock-free fast path.  Therefore while we hold the lock no
-     * concurrent fast-path push can steal a slot we freed.  ring_push here
-     * is effectively single-threaded on the producer side.
+     * A receiver may have registered on a ring that a fast-path sender filled
+     * before its recv_waiter_cnt became visible, so it is parked while data
+     * sits in the ring; the drain rescues it.  Crucially, EVERY ring op's
+     * result is checked: a stale fast-path sender (one that passed the
+     * waiter-count gate before a receiver registered) can still reserve a slot
+     * concurrently, so ring_push can fail even here.  Buffer-then-drain never
+     * loses or duplicates `data` — if the push fails, `data` stays in hand and
+     * we park below; the earlier pop-then-push swap dropped `data` on a failed
+     * push.
      */
     if (ring_push(ch, data)) {
-        chan_waiter_t *r = waitq_pop_receiver(&ch->recv_waiters);
+        chan_deliver_ring_to_receivers_locked(ch);
         chan_unlock(&ch->lock);
-        if (r) { r->result = CHAN_OK; chan_park_wake(r->wake_park); }
         return CHAN_OK;
     }
 
-    /* Ring still full — park. */
+    /* Ring full — park.  First rescue any parked receivers (delivering ring
+     * items may free a slot for us at the re-check below). */
+    chan_deliver_ring_to_receivers_locked(ch);
+
     if (timeout_ns == 0) { chan_unlock(&ch->lock); return CHAN_ERR_WOULDBLOCK; }
 
     chan_waiter_t self;
@@ -161,6 +143,7 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
     if (ring_push(ch, data)) {
         waitq_remove(&ch->send_waiters, &self);
         atomic_fetch_sub_explicit(&ch->send_waiter_cnt, 1, memory_order_relaxed);
+        chan_deliver_ring_to_receivers_locked(ch);   /* deliver data to a parked receiver if any */
         chan_unlock(&ch->lock);
         waiter_destroy(&self);
         return CHAN_OK;

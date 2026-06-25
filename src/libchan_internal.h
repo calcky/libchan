@@ -293,8 +293,12 @@ static inline void waitq_close_all(chan_waitq_t *q) {
  * helpers: after a successful push/pop, if the opposite waiter count is
  * non-zero, hand parked waiters the buffered data and wake them.  Best-effort
  * and FIFO-preserving (oldest ring slot to the next receiver). */
-static inline void chan_deliver_ring_to_receivers(struct chan *ch) {
-    chan_lock(&ch->lock);
+
+/* Lock-held variant: caller already holds ch->lock.  Delivers buffered ring
+ * items (oldest first) to parked receivers and wakes them.  Every ring op is
+ * checked, so it tolerates concurrent stale fast-path ops without losing or
+ * duplicating an item. */
+static inline void chan_deliver_ring_to_receivers_locked(struct chan *ch) {
     while (!ring_empty(ch)) {
         chan_waiter_t *r = waitq_pop_receiver(&ch->recv_waiters);
         if (!r) break;
@@ -305,6 +309,11 @@ static inline void chan_deliver_ring_to_receivers(struct chan *ch) {
         r->result = CHAN_OK;
         chan_park_wake(r->wake_park);
     }
+}
+
+static inline void chan_deliver_ring_to_receivers(struct chan *ch) {
+    chan_lock(&ch->lock);
+    chan_deliver_ring_to_receivers_locked(ch);
     chan_unlock(&ch->lock);
 }
 
