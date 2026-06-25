@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782359315486,
+  "lastUpdate": 1782369333625,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -259,6 +259,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.61,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "ea7642d6edbe75a9f638f96e898e66f209b4f0cf",
+          "message": "fix: MPMC buffered send dropped a message on a failed FIFO-swap push\n\nSymptom\n-------\nCI's TSan job failed intermittently with a message LOSS (not a data race):\n\n    test_stress cap=1: expected 400000 got 399999\n\ni.e. chan_send returned CHAN_OK for a message that was never received.\n\nCause\n-----\nIn the buffered send slow path, when a receiver was waiting, the code did a\nFIFO-preserving swap: pop the OLDEST ring item for the receiver, then push the\nnew `data` at the tail:\n\n    if (!ring_empty(ch) && ring_pop(ch, r->data)) {\n        ring_push(ch, data);    /* \"slot just freed -> succeeds\"  <-- WRONG */\n    }\n\nThe `ring_push` return value was ignored on the assumption that the slot we\njust freed guarantees room. It does not: a *stale* fast-path sender — one that\npassed the `send_waiter_cnt==0 && recv_waiter_cnt==0` gate BEFORE this receiver\nregistered — can still be mid `ring_lf_push` and reserve the freed slot\nconcurrently (the same \"stale fast-path op\" race the recv side already guards\nagainst). When that happens ring_push fails, `data` is neither buffered nor\ndelivered, yet chan_send returns CHAN_OK. One message vanishes.\n\nBenign on a lightly-loaded box; the window widens sharply with more threads\nthan cores (heavy preemption between the gate check and the push), which is\nwhy it surfaced on the 4-core CI runner under TSan but not on a 20-core dev box.\n\nReproduction\n------------\n8 producers + 8 consumers, cap=1, all hammering the single slot; instrument the\ntest to read ring_lf_count(&ch->ring) after every thread has exited:\n\n    build: cmake -B b -DLIBCHAN_SANITIZE=thread && cmake --build b\n    run:   setarch -R taskset -c 0-3 ./repro   # pin to 4 cores, ASLR off\n\nBefore the fix this loses ~1 message within ~1000 iterations, always with\nring_left_after_drain == 0 — proving the lost item never entered the ring\n(a send-side drop), not a stuck/undrained buffer.\n\nFix\n---\nReplace the fragile pop-then-push swap with buffer-then-drain, checking EVERY\nring op:\n\n  - ring_push(data) first; then deliver buffered items to parked receivers in\n    FIFO order via a new lock-held helper chan_deliver_ring_to_receivers_locked\n    (oldest slot to the next receiver, each ring_pop checked).\n  - If ring_push fails (ring genuinely full / lost the slot to a stale sender),\n    `data` stays in hand and we park as a sender — never dropped.\n\nThis also removes latent dead-code that could wake a receiver with no data\nwritten (a phantom delivery). The recv side already checked its ring_push\nreturn value, so only the send side was affected.\n\nVerification\n------------\nAfter the fix: 0 lost across 150k normal iterations + TSan iterations of the\n8P+8C cap=1 repro (was failing by iter ~909 before); full suite 7/7 on normal\nand ASan; TSan test_stress + test_mpmc 0 races / 0 losses.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T14:32:14+08:00",
+          "tree_id": "f1401ec910c3465f0f0b55e019e7691976ffcaeb",
+          "url": "https://github.com/calcky/libchan/commit/ea7642d6edbe75a9f638f96e898e66f209b4f0cf"
+        },
+        "date": 1782369332903,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 70.19,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 8.77,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 68.13,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 86.43,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.44,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.19,
             "unit": "Mops/s"
           }
         ]
