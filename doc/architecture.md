@@ -28,7 +28,7 @@ flowchart TB
 
     subgraph PRIM["底层原语"]
         direction LR
-        RING["ring_lf.c<br/>无锁 Vyukov MPMC 环<br/>(快路径)"]
+        RING["ring_lf.c<br/>无锁 MPMC 环<br/>(快路径)"]
         WAITQ["waitq.c<br/>等待者队列<br/>(慢路径)"]
         PARK["park.c<br/>futex / pthread cond<br/>阻塞与唤醒"]
         UTIL["util.c<br/>自旋退避"]
@@ -55,7 +55,7 @@ flowchart TB
     class WAITQ,PARK slow;
 ```
 
-> 绿色 = 无锁快路径，橙色 = 加锁慢路径。每个通道含一个 Vyukov 环（缓冲）、
+> 绿色 = 无锁快路径，橙色 = 加锁慢路径。每个通道含一个无锁环（缓冲）、
 > 两个等待队列（send/recv）、两个原子 waiter 计数，外加一把保护慢路径的 mutex。
 
 ---

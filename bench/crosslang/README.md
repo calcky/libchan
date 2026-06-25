@@ -4,7 +4,7 @@
 
 | 实现 | 语言 | channel 类型 |
 |------|------|-------------|
-| [libchan](libchan/bench.c) | C11 | MPMC 有界，Vyukov 无锁 ring + Linux futex park |
+| [libchan](libchan/bench.c) | C11 | MPMC 有界，DPDK 风格无锁 ring + Linux futex park |
 | Go 内置 `chan` | Go | MPMC 有界/无缓冲，goroutine 调度 park |
 | [`crossbeam-channel`](rust/src/main.rs) | Rust | MPMC 有界，crossbeam ring + futex Parker |
 
@@ -127,5 +127,5 @@ select! { send(data_tx, v) -> _ => {...}, recv(stop_rx) -> _ => break }
 | S6  8P+8C cap=1024 |  **9.620** |  3.238 |  6.053 | libchan |
 
 **结论**：6 个场景 libchan 赢 5 个。全部有缓冲场景（S2–S6）超过 Go 与 crossbeam，
-得益于无锁 Vyukov ring 快路径（S3 ≈ 40 ns/op）。唯一落后的 S1 是 OS 线程对
+得益于无锁 ring 快路径（S3 ≈ 40 ns/op）。唯一落后的 S1 是 OS 线程对
 Go 协程在同步 rendezvous 上的固有劣势，非实现缺陷。

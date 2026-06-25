@@ -7,7 +7,7 @@
  *   A 档 · 几乎不 park（测 "channel 自己有多快"）:
  *     1. 裸 memcpy            —— 硬件极限
  *     2. atomic_fetch_add     —— 无锁原语下界
- *     3. Vyukov ring 纯队列    —— 队列数据结构本身(不经 chan)
+ *     3. 无锁 ring 纯队列      —— 队列数据结构本身(不经 chan)
  *     4. chan try_send/recv   —— + channel 语义(无等待)
  *     5. chan SPSC 跨核稳态  —— 真并发、busy-poll 不 park 的无锁快路径(跨核传递)
  *
@@ -93,7 +93,7 @@ static double bench_atomic(void *ctx) {
     return (double)dt / A_ITERS;
 }
 
-/* Vyukov ring 纯队列:单线程 push 一个 / pop 一个,完全不经 chan、不 park。 */
+/* 无锁 ring 纯队列:单线程 push 一个 / pop 一个,完全不经 chan、不 park。 */
 static double bench_ring_pure(void *ctx) {
     (void)ctx;
     chan_ring_lf_t r;
@@ -227,7 +227,7 @@ int main(void) {
            "--------", "--------", "--------");
     run_point("1. 裸 memcpy（硬件极限）",        bench_memcpy,           NULL);
     run_point("2. atomic_fetch_add（无锁下界）", bench_atomic,           NULL);
-    run_point("3. Vyukov ring 纯队列",           bench_ring_pure,        NULL);
+    run_point("3. 无锁 ring 纯队列",           bench_ring_pure,        NULL);
     run_point("4. chan try_send/recv（无等待）", bench_chan_try,         NULL);
     bool steady_mpmc = false, steady_spsc = true;
     run_point("5. chan MPMC 跨核稳态（缓存一致性墙）", bench_chan_steady, &steady_mpmc);
