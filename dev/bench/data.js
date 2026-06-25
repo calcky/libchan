@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782355523691,
+  "lastUpdate": 1782357691635,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -155,6 +155,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.63,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "ff08e928fed1166e65c15ddf10f099702938939f",
+          "message": "docs/i18n: translate all Chinese comments and docs to English\n\nConvert every Chinese comment, doc, CI string, and benchmark label across\nthe repository to natural technical English. Going forward, comments and\ndocs are English-only.\n\nScope: README, all doc/*.md, all examples/*.c, all bench code + scripts +\ncrosslang (C/Go/Rust/sh), .github workflow + parser scripts, and the two\nremaining src/ inline comments. No code logic, identifiers, numbers, paths,\nor output formats changed; CI parsers and the full test suite verified green.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T11:20:15+08:00",
+          "tree_id": "f1fcc06b505d264ec04accd268138eb751371507",
+          "url": "https://github.com/calcky/libchan/commit/ff08e928fed1166e65c15ddf10f099702938939f"
+        },
+        "date": 1782357690927,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 49.4,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 5.29,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 19.46,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 34.85,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.4,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.24,
             "unit": "Mops/s"
           }
         ]
