@@ -166,3 +166,56 @@ jobs:
             crosslang.txt
             doc/comparison.md
           if-no-files-found: warn
+
+  # ── Coverage (gcov + gcovr) ─────────────────────────────────────────────
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcovr
+        run: pipx install gcovr
+
+      - name: Configure (coverage)
+        run: >
+          cmake -B build-cov
+          -DCMAKE_BUILD_TYPE=Debug
+          -DLIBCHAN_COVERAGE=ON
+          -DLIBCHAN_BUILD_TESTS=ON
+          -DLIBCHAN_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build-cov --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build-cov --output-on-failure --no-tests=error
+
+      - name: Coverage report
+        run: |
+          mkdir -p coverage
+          gcovr --root . --filter 'src/' --gcov-ignore-parse-errors \
+                --txt coverage/coverage.txt \
+                --html-details coverage/index.html \
+                --json-summary coverage/summary.json \
+                --cobertura coverage/cobertura.xml \
+                build-cov
+          line=$(python3 -c "import json;print('%.1f'%json.load(open('coverage/summary.json'))['line_percent'])")
+          branch=$(python3 -c "import json;print('%.1f'%json.load(open('coverage/summary.json'))['branch_percent'])")
+          func=$(python3 -c "import json;print('%.1f'%json.load(open('coverage/summary.json'))['function_percent'])")
+          {
+            echo "## Coverage (library \`src/\`)"
+            echo "**Line ${line}% · Branch ${branch}% · Function ${func}%**"
+            echo ""
+            echo '```'
+            cat coverage/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/
+          if-no-files-found: warn
+

@@ -14,6 +14,7 @@ set(LIBCHAN_SPIN_LIMIT 40 CACHE STRING "Spin iterations before sleeping (0 = dis
 
 include(cmake/CompilerWarnings.cmake)
 include(cmake/Sanitizers.cmake)
+include(cmake/Coverage.cmake)
 find_package(Threads REQUIRED)
 
 # Platform detection
@@ -49,6 +50,7 @@ target_compile_definitions(chan_objs PRIVATE
 
 chan_set_compiler_warnings(chan_objs)
 chan_enable_sanitizers(chan_objs)
+chan_enable_coverage(chan_objs)
 target_compile_definitions(chan_objs PRIVATE _GNU_SOURCE)
 
 if(LIBCHAN_BUILD_SHARED)
