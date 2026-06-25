@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782369333625,
+  "lastUpdate": 1782370595321,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -311,6 +311,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.19,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "f9e3cd3a57d9e94aeabcdec436e0183cd18a4c15",
+          "message": "test+ci: N×M exactly-once stress, SPSC ordering test, edge UT, coverage report\n\nTests\n-----\n- test_nm_stress: exhaustive N×M producer/consumer matrix (10 shapes —\n  symmetric, asymmetric, prime counts — x caps {0,1,4,64,1024}). Each producer\n  sends K distinct values; afterwards verifies count conservation AND\n  exactly-once delivery via a per-value atomic seen-counter (catches both loss\n  and duplication). This is the check that would have caught the buffered-send\n  message-loss bug directly.\n- test_spsc_order: FIFO ordering guarantee. One producer sends 0..K-1; the\n  consumer must receive them strictly in order. Covers chan_create_spsc across\n  caps (incl. a non-power-of-2), single-producer default MPMC, and unbuffered;\n  small caps force per-op parking so the blocking path's ordering is exercised,\n  not just the lock-free fast path.\n- test_timeout: timeout/non-blocking/error-path coverage — real timeouts\n  firing, recv_timeout succeeding via a late sender, try_* on full/empty,\n  NULL/zero-size validation, len/cap, retain/destroy refcounting, close\n  idempotency + send-after-close + drain-after-close, select try/timeout/send/\n  blocking paths, strerror, and large elements.\n\nAll three pass on normal, ASan/UBSan, and TSan (0 races); nm_stress and\nspsc_order run under TSan's aggressive scheduling with exactly-once and order\nboth holding.\n\nCoverage\n--------\n- New -DLIBCHAN_COVERAGE option (cmake/Coverage.cmake): --coverage with\n  -fprofile-update=atomic (required so the threaded counter updates don't race)\n  on the library objects; the test helper links the gcov runtime.\n- New CI `coverage` job: builds instrumented, runs the suite, and produces a\n  gcovr report — line/branch/function summary written to the run's Summary page\n  plus an HTML report and cobertura.xml uploaded as artifacts. Current baseline\n  ~86% line / ~74% branch on src/.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T14:53:51+08:00",
+          "tree_id": "17201563a84ed46442c8732cc31a6e18887b67ca",
+          "url": "https://github.com/calcky/libchan/commit/f9e3cd3a57d9e94aeabcdec436e0183cd18a4c15"
+        },
+        "date": 1782370594553,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 50.18,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 5.75,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 16.98,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 35.24,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.48,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 2.08,
             "unit": "Mops/s"
           }
         ]
