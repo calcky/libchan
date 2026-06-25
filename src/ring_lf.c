@@ -103,6 +103,88 @@ bool ring_lf_pop(chan_ring_lf_t *r, void *out) {
     return true;
 }
 
+uint32_t ring_lf_enqueue_burst(chan_ring_lf_t *r, const void *data, uint32_t n) {
+    uint32_t ph, pnext, k;
+    int spin = 0;
+    if (n == 0) return 0;
+
+    /* Phase 1 — Reserve up to n contiguous producer slots via one CAS.
+     * free = capacity - in-use; clamp the batch to it. */
+    do {
+        ph = atomic_load_explicit(&r->prod.head, memory_order_relaxed);
+        uint32_t ct = atomic_load_explicit(&r->cons.tail, memory_order_acquire);
+        uint32_t free_entries = r->capacity - (ph - ct);
+        if (free_entries == 0)
+            return 0;   /* full */
+        k = n < free_entries ? n : free_entries;
+        pnext = ph + k;
+    } while (!atomic_compare_exchange_weak_explicit(
+                 &r->prod.head, &ph, pnext,
+                 memory_order_relaxed, memory_order_relaxed));
+
+    /* Phase 2 — Write the reserved run, splitting at the power-of-2 wrap. */
+    uint32_t idx   = ph & r->mask;
+    uint32_t first = r->capacity - idx;   /* slots from idx to end-of-buffer */
+    if (first >= k) {
+        memcpy(r->slots + (size_t)idx * r->elem_size,
+               data, (size_t)k * r->elem_size);
+    } else {
+        memcpy(r->slots + (size_t)idx * r->elem_size,
+               data, (size_t)first * r->elem_size);
+        memcpy(r->slots,
+               (const char *)data + (size_t)first * r->elem_size,
+               (size_t)(k - first) * r->elem_size);
+    }
+
+    /* Phase 3 — Commit: one ordered wait + release-store for the whole run.
+     * Same release-sequence reasoning as ring_lf_push (acquire wait-load). */
+    spin = 0;
+    while (atomic_load_explicit(&r->prod.tail, memory_order_acquire) != ph)
+        chan_spin_hint(spin++);
+    atomic_store_explicit(&r->prod.tail, pnext, memory_order_release);
+    return k;
+}
+
+uint32_t ring_lf_dequeue_burst(chan_ring_lf_t *r, void *out, uint32_t n) {
+    uint32_t ch, cnext, k;
+    int spin = 0;
+    if (n == 0) return 0;
+
+    /* Phase 1 — Reserve up to n contiguous consumer slots via one CAS.
+     * avail = committed - already-reserved; clamp the batch to it. */
+    do {
+        ch = atomic_load_explicit(&r->cons.head, memory_order_relaxed);
+        uint32_t pt = atomic_load_explicit(&r->prod.tail, memory_order_acquire);
+        uint32_t avail = pt - ch;
+        if (avail == 0)
+            return 0;   /* empty */
+        k = n < avail ? n : avail;
+        cnext = ch + k;
+    } while (!atomic_compare_exchange_weak_explicit(
+                 &r->cons.head, &ch, cnext,
+                 memory_order_relaxed, memory_order_relaxed));
+
+    /* Phase 2 — Read the reserved run, splitting at the power-of-2 wrap. */
+    uint32_t idx   = ch & r->mask;
+    uint32_t first = r->capacity - idx;
+    if (first >= k) {
+        memcpy(out, r->slots + (size_t)idx * r->elem_size,
+               (size_t)k * r->elem_size);
+    } else {
+        memcpy(out, r->slots + (size_t)idx * r->elem_size,
+               (size_t)first * r->elem_size);
+        memcpy((char *)out + (size_t)first * r->elem_size,
+               r->slots, (size_t)(k - first) * r->elem_size);
+    }
+
+    /* Phase 3 — Commit (symmetric to enqueue burst). */
+    spin = 0;
+    while (atomic_load_explicit(&r->cons.tail, memory_order_acquire) != ch)
+        chan_spin_hint(spin++);
+    atomic_store_explicit(&r->cons.tail, cnext, memory_order_release);
+    return k;
+}
+
 uint32_t ring_lf_count(const chan_ring_lf_t *r) {
     uint32_t pt = atomic_load_explicit(&r->prod.tail, memory_order_relaxed);
     uint32_t ch = atomic_load_explicit(&r->cons.head, memory_order_relaxed);

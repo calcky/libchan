@@ -20,3 +20,8 @@ add_chan_test(test_close)
 add_chan_test(test_mpmc)
 add_chan_test(test_select)
 add_chan_test(test_stress)
+
+# test_bulk exercises the internal ring bulk API directly, so it also needs the
+# src/ include path for ring_lf.h.
+add_chan_test(test_bulk)
+target_include_directories(test_bulk PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -175,5 +175,7 @@ sequenceDiagram
 
 - Concurrency design and memory-ordering details: [`design.md`](design.md)
 - Lock-free ring protocol (reserve->write->commit): top-of-file comments in [`src/ring_lf.h`](../src/ring_lf.h)
+- Bulk enqueue/dequeue (`ring_lf_enqueue_burst` / `ring_lf_dequeue_burst`: one CAS + one commit
+  amortizes the cross-core cost): see [`benchmarks.md` §0.5](benchmarks.md) and `bench/bench_bulk.c`
 - Cross-language performance comparison: [`comparison.md`](comparison.md)
 - API reference: [`api_reference.md`](api_reference.md)

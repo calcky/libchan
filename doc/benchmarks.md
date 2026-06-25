@@ -89,6 +89,37 @@ blocking streaming beats busy-poll" conclusions are consistent.
 
 ---
 
+## 0.5 Bulk API breaks the "cross-core wall" (`bench_bulk`)
+
+The 121 ns / 8 Mops in §0 is the physical wall of the **single-element** MPMC cross-core
+steady-state — but that wall charges one cross-core round trip **per CAS + per Phase-3 commit**,
+**not per element**. `ring_lf_enqueue_burst` / `ring_lf_dequeue_burst` reserve k contiguous slots
+in one CAS and commit the whole batch with one Phase-3 store, amortizing that fixed cross-core
+traffic over k elements — **per-element cost drops ~1/k, until the memcpy itself dominates**.
+
+`bench_bulk` (dev machine i7-13700H, `-O3`, core-pinned, one op = one element through
+enqueue + dequeue):
+
+| batch | 1T ns/elem | 1T Mops/s | 2P+2C ns/elem | 2P+2C Mops/s |
+|------:|-----------:|----------:|--------------:|-------------:|
+| 1     | 16.80      | 59.5      | 170.4         | 5.9 |
+| 8     | 2.40       | 417       | 22.3          | 44.9 |
+| 32    | 0.78       | 1284      | 5.74          | 174 |
+| 128   | 0.26       | 3888      | 1.56          | **641** |
+
+> **How to read this**:
+> - `batch=1` equals the single-element `ring_lf_push/pop` baseline; the 2P+2C 170 ns / 5.9 Mops
+>   is exactly the §0 cross-core wall (here 2P+2C contention is slightly heavier than §0's 1P1C).
+> - **Key insight**: batching does not make cache coherence faster — it **carries more payload per
+>   cross-core round trip**. Under 2P+2C, batch 1→128 lifts throughput from **5.9 → 641 Mops (109×)**,
+>   far past the "physical wall", because the wall is per-CAS/per-commit, not per-element.
+> - Single-thread batch 128 reaches 0.26 ns/elem (3888 Mops), the order of an 8 B in-L1 memcpy —
+>   the lock-free bookkeeping is essentially amortized away, leaving only the raw data move.
+> - Safety is unchanged: the bulk path runs the same reserve→write→commit three-phase protocol and
+>   memory ordering (passes TSan), remains MPMC-safe, and never touches the SPSC cache fields.
+
+---
+
 ## 1. Park backend comparison: futex vs pthread
 
 `bench_lock_overhead` runs once each with futex (the Linux default) and pthread condvar

@@ -10,6 +10,17 @@
  *
  * Protocol (single-element dequeue) is symmetric using cons.head/cons.tail.
  *
+ * Bulk variants (ring_lf_enqueue_burst / ring_lf_dequeue_burst) run the SAME
+ * three-phase protocol but reserve up to n contiguous slots in ONE CAS, copy
+ * the whole run (split into two memcpy when it wraps the power-of-2 boundary),
+ * and do ONE Phase-3 commit.  This amortises the CAS, the cross-core read of
+ * the opposite cursor, and the Phase-3 wait over the whole batch — per-element
+ * cross-core traffic drops ~1/k — while keeping the single-element memory
+ * ordering verbatim (the release-store of prod.tail/cons.tail still publishes
+ * every slot write/read in the run).  Burst semantics: enqueue/dequeue as many
+ * as fit/are available, up to n; return the count actually moved (0 when full/
+ * empty).  Both are MPMC-safe and never touch the SPSC cache fields.
+ *
  * The acquire-load of prod.tail in dequeue Phase 1 synchronises with the
  * producer's release-store of prod.tail, so the data is visible before it
  * is read.  No additional fence is required between Phase 1 and Phase 2.
@@ -65,6 +76,14 @@ void ring_lf_destroy(chan_ring_lf_t *r);
 /* Returns true on success; false if full (push) or empty (pop). */
 bool ring_lf_push(chan_ring_lf_t *r, const void *data);
 bool ring_lf_pop (chan_ring_lf_t *r, void *out);
+
+/* Bulk variants — MPMC-safe burst enqueue/dequeue.
+ * `data`/`out` point to n contiguous elements of elem_size each.
+ * Reserve up to n slots in one CAS, copy the run (wrap-aware), one Phase-3
+ * commit.  Return the number of elements actually moved (<= n; 0 when the ring
+ * is full / empty).  See the protocol note above. */
+uint32_t ring_lf_enqueue_burst(chan_ring_lf_t *r, const void *data, uint32_t n);
+uint32_t ring_lf_dequeue_burst(chan_ring_lf_t *r, void *out,        uint32_t n);
 
 /* SPSC-only cursor-cached fast variants are defined as static inline in
  * libchan_internal.h (ring_spsc_push / ring_spsc_pop) so they inline into
