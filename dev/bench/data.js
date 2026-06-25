@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782354466658,
+  "lastUpdate": 1782355015660,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -51,6 +51,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.26,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "f45eb7052c14aafaeb39a416f69a2a07988d41a7",
+          "message": "fix: acquire Phase-3 wait-load in MPMC ring (fix data race on weak memory)\n\nThe DPDK-style ring committed prod.tail/cons.tail in Phase 3 with a relaxed\nspin-load. A consumer's acquire-load of prod.tail then synchronises-with only\nthe single producer that wrote the exact value it read; when it observes the\ntail advanced past its slot by a *later* producer, the C11 release sequence is\nbroken (a plain cross-thread store ends it), so there is no happens-before\nedge to the producer that actually wrote that slot — a genuine data race on\nthe slot memcpy. Benign on x86 (TSO), real on weak memory (ARM); ThreadSanitizer\nin CI flagged it on test_mpmc/test_stress (functionally still lossless).\n\nFix: make the Phase-3 wait-loads acquire so each producer synchronises-with its\npredecessor, chaining happens-before along the tail cursor. A consumer ordered\nafter the latest tail value is then ordered after every prior producer's slot\nwrite. Symmetric on cons.tail for slot-reuse ordering.\n\nAcquire-load is a plain mov on x86 → zero throughput change (showcase MPMC/SPSC\nsteady unchanged within noise). Verified: TSan now 0 races on all 6 tests\n(was 14+ on test_mpmc); normal + ASan suites 6/6.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T10:35:48+08:00",
+          "tree_id": "b6143ccddc826dc82e055beb96e87bf52c5ae6a0",
+          "url": "https://github.com/calcky/libchan/commit/f45eb7052c14aafaeb39a416f69a2a07988d41a7"
+        },
+        "date": 1782355014855,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv（无等待）",
+            "value": 50.8,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC 跨核稳态（缓存一致性墙）",
+            "value": 5.65,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC 跨核稳态（游标缓存破墙）",
+            "value": 15.77,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC 阻塞 cap=1024",
+            "value": 36.92,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan 无缓冲 rendezvous",
+            "value": 1.43,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1,
             "unit": "Mops/s"
           }
         ]
