@@ -1,0 +1,168 @@
+# libchan CI — unit tests + sanitizers + benchmarks, with reports on the
+# Actions run-summary page and benchmark regression tracking on gh-pages.
+#
+# One-time repo setup required:
+#   - Settings → Actions → General → Workflow permissions → "Read and write"
+#     (lets the benchmark job push history to the gh-pages branch).
+#   - (optional) Settings → Pages → Branch: gh-pages   to view the trend chart
+#     at https://<owner>.github.io/<repo>/dev/bench/
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Unit tests (ctest) ──────────────────────────────────────────────────
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLIBCHAN_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        # --no-tests=error turns "0 tests registered" into a failure (guards
+        # against a vacuously-green run); --output-junit feeds the report step.
+        run: ctest --test-dir build --output-on-failure --no-tests=error --output-junit ctest.xml
+
+      - name: Report → job summary
+        if: always()
+        run: python3 .github/scripts/junit_to_summary.py build/ctest.xml "单元测试 (ctest)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-junit
+          path: build/ctest.xml
+          if-no-files-found: warn
+
+  # ── Sanitizers (ASan+UBSan, TSan) ───────────────────────────────────────
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: asan, flags: "address,undefined" }
+          - { name: tsan, flags: "thread" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lower ASLR entropy (sanitizer "unexpected memory mapping" fix)
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure (${{ matrix.name }})
+        run: >
+          cmake -B b-${{ matrix.name }}
+          -DCMAKE_BUILD_TYPE=Debug
+          -DLIBCHAN_SANITIZE=${{ matrix.flags }}
+          -DLIBCHAN_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build b-${{ matrix.name }} --parallel
+
+      - name: Run tests under ${{ matrix.name }}
+        run: ctest --test-dir b-${{ matrix.name }} --output-on-failure --no-tests=error
+
+      - name: Report → job summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### ✅ 消毒器 ${{ matrix.name }} (\`${{ matrix.flags }}\`)：全部通过" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ❌ 消毒器 ${{ matrix.name }} (\`${{ matrix.flags }}\`)：失败 — 见日志" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ── Benchmarks (showcase + cross-language) with regression tracking ──────
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # github-action-benchmark pushes to gh-pages
+      pull-requests: write      # ...and may comment on a regression alert
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench/crosslang/rust
+
+      - name: Build benchmarks
+        run: |
+          cmake -B build-bench -DCMAKE_BUILD_TYPE=Release -DLIBCHAN_BUILD_BENCH=ON
+          cmake --build build-bench --parallel
+
+      - name: Run showcase ladder
+        run: ./build-bench/bench/bench_showcase | tee showcase.txt
+
+      - name: Showcase → job summary + bench.json
+        run: |
+          {
+            echo "## 性能基准"
+            echo "> ⚠️ GitHub 共享 runner ~4 核、无核绑定,绝对数字会抖动,**仅供趋势参考**。"
+            echo ""
+            echo "### 性能阶梯 (bench_showcase)"
+            echo '```'
+            cat showcase.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 .github/scripts/showcase_to_bench_json.py showcase.txt > bench.json
+
+      - name: Benchmark regression tracking
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: libchan throughput (Mops/s)
+          tool: customBiggerIsBetter
+          output-file-path: bench.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Only write the baseline from master pushes; PRs/branches compare-only.
+          auto-push: ${{ github.ref == 'refs/heads/master' }}
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          # Shared-runner noise → lenient threshold, comment-only (don't fail CI).
+          alert-threshold: '200%'
+          comment-on-alert: true
+          fail-on-alert: false
+
+      - name: Cross-language comparison (libchan vs Go vs crossbeam)
+        # Informational: a toolchain hiccup here must not red the whole job.
+        continue-on-error: true
+        run: |
+          bash bench/crosslang/run_comparison.sh | tee crosslang.txt || true
+          {
+            echo ""
+            echo "<details><summary>跨语言对比 (libchan vs Go vs crossbeam)</summary>"
+            echo ""
+            cat doc/comparison.md 2>/dev/null || echo "(comparison.md 未生成)"
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: |
+            showcase.txt
+            bench.json
+            crosslang.txt
+            doc/comparison.md
+          if-no-files-found: warn

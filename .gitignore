@@ -23,3 +23,12 @@ bench/crosslang/rust/target/
 *.swp
 core
 *.core
+
+# ── Claude Code local tooling (settings, worktrees) ─────────────
+.claude/
+
+# ── CI scratch outputs ──────────────────────────────────────────
+ctest.xml
+showcase.txt
+crosslang.txt
+bench.json
