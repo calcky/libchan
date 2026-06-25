@@ -1,270 +1,270 @@
 # Internal Design
 
-本文档面向希望了解 libchan 内部实现、进行性能调优或贡献代码的读者。
+This document is intended for readers who want to understand libchan's internal implementation, perform performance tuning, or contribute code.
 
 ---
 
-## 整体架构
+## Overall Architecture
 
-libchan 采用**单把 mutex + FIFO 等待队列**的经典模型，与 Go runtime 的 channel 实现策略一致（Go 也不是 lock-free）。
+libchan adopts the classic model of a **single mutex + FIFO wait queue**, consistent with the Go runtime's channel implementation strategy (Go is not lock-free either).
 
-**为何不用 lock-free MPMC 队列？**
+**Why not a lock-free MPMC queue?**
 
-lock-free 方案（如 Vyukov bounded queue）在无竞争时延迟极低，但其正确性建立在不涉及外部同步的前提上。libchan 需要：
+Lock-free approaches (such as the Vyukov bounded queue) have extremely low latency under no contention, but their correctness rests on the premise of not involving external synchronization. libchan requires:
 
-1. **close 语义**：关闭时原子地唤醒所有等待者，这要求在 "close 标志写入" 与 "等待者出队" 之间建立严格的顺序——lock-free 队列无法直接表达这种跨操作原子性。
-2. **阻塞语义**：无论如何都需要一套 park/unpark 机制；加上这一层后，lock-free 带来的延迟优势大幅缩小。
-3. **ABA 与内存回收**：C 没有 GC，lock-free 队列需要 hazard pointer 或 epoch-based reclamation，工程复杂度远超收益。
+1. **close semantics**: on close, atomically wake all waiters. This requires a strict ordering between "writing the close flag" and "dequeuing waiters"—a lock-free queue cannot directly express this cross-operation atomicity.
+2. **blocking semantics**: a park/unpark mechanism is needed regardless; once this layer is added, the latency advantage of lock-free shrinks dramatically.
+3. **ABA and memory reclamation**: C has no GC, so a lock-free queue needs hazard pointers or epoch-based reclamation, whose engineering complexity far exceeds the benefit.
 
-在低/中等竞争下，自旋退避（见 [Park 抽象](#park-抽象)）使得"加锁临界区极短"这一特点足以补偿单一全局锁的理论劣势。
+Under low/moderate contention, spin backoff (see [Park Abstraction](#park-abstraction)) makes the "extremely short locked critical section" characteristic sufficient to compensate for the theoretical disadvantage of a single global lock.
 
 ---
 
-## 核心数据结构
+## Core Data Structures
 
-### `struct chan`（`src/libchan_internal.h`）
+### `struct chan` (`src/libchan_internal.h`)
 
 ```
 struct chan {
-    /* ---- 不可变字段（创建后只读，无需同步） ---- */
+    /* ---- immutable fields (read-only after creation, no synchronization needed) ---- */
     size_t        elem_size;
-    size_t        capacity;       /* 0 = 无缓冲 */
+    size_t        capacity;       /* 0 = unbuffered */
 
-    /* ---- 以下字段由 lock 保护 ---- */
-    chan_mutex_t  lock;           /* CHAN_ALIGNED：64 字节缓存行对齐 */
+    /* ---- the following fields are protected by lock ---- */
+    chan_mutex_t  lock;           /* CHAN_ALIGNED: aligned to 64-byte cache line */
 
-    void         *buf;            /* 环形缓冲区，capacity > 0 时分配 */
-    size_t        head, tail;     /* 环形缓冲区读/写指针 */
-    size_t        count;          /* 当前元素数，区分满/空二义性 */
+    void         *buf;            /* ring buffer, allocated when capacity > 0 */
+    size_t        head, tail;     /* ring buffer read/write pointers */
+    size_t        count;          /* current element count, disambiguates full/empty */
 
     chan_waitq_t  send_waiters;   /* CHAN_ALIGNED */
     chan_waitq_t  recv_waiters;   /* CHAN_ALIGNED */
 
-    /* ---- 原子字段（无需持锁即可读） ---- */
+    /* ---- atomic fields (readable without holding the lock) ---- */
     _Atomic bool  closed;
     _Atomic int   refcount;
 };
 ```
 
-`CHAN_ALIGNED`（64 字节对齐）将 `lock`、`send_waiters`、`recv_waiters` 分别放在独立的缓存行，避免在高并发下三者之间的伪共享（false sharing）。
+`CHAN_ALIGNED` (64-byte aligned) places `lock`, `send_waiters`, and `recv_waiters` on separate cache lines respectively, avoiding false sharing among the three under high concurrency.
 
-### `chan_waiter_t`（`src/libchan_internal.h`）
+### `chan_waiter_t` (`src/libchan_internal.h`)
 
-等待节点**栈分配**于调用 `chan_send` / `chan_recv` 的线程栈上，无堆分配开销。
+The waiter node is **stack-allocated** on the stack of the thread calling `chan_send` / `chan_recv`, with no heap allocation overhead.
 
 ```
 struct chan_waiter {
-    struct chan_waiter *next;       /* 侵入式链表指针 */
-    void              *data;        /* SEND: 指向调用方数据；RECV: 指向输出缓冲区 */
+    struct chan_waiter *next;       /* intrusive linked-list pointer */
+    void              *data;        /* SEND: points to caller data; RECV: points to output buffer */
     chan_op_t          op;
-    chan_err_t         result;      /* 唤醒方填写 */
-    size_t             case_idx;    /* 被哪个 select case 赢得（非 select 时为 -1） */
-    chan_park_t       *wake_park;   /* 唤醒目标：普通等待者指向 &self.park；select 存根指向 shared_park */
-    _Atomic int       *select_state; /* NULL（普通）；select 存根指向共享原子状态 */
-    chan_park_t        park;        /* 停泊存储（只有非 select 等待者使用） */
+    chan_err_t         result;      /* filled in by the waker */
+    size_t             case_idx;    /* which select case won (-1 when not a select) */
+    chan_park_t       *wake_park;   /* wake target: normal waiter points to &self.park; select stub points to shared_park */
+    _Atomic int       *select_state; /* NULL (normal); select stub points to the shared atomic state */
+    chan_park_t        park;        /* park storage (used only by non-select waiters) */
 };
 ```
 
-`wake_park` 和 `select_state` 这两个指针字段是 select 实现的关键（详见 [Select 多路复用](#select-多路复用)）。
+The two pointer fields `wake_park` and `select_state` are the key to the select implementation (see [Select Multiplexing](#select-multiplexing)).
 
 ### `chan_waitq_t`
 
-FIFO 单向链表，头尾各一个指针：
+A FIFO singly-linked list with a head and tail pointer:
 
 ```c
 typedef struct { chan_waiter_t *head, *tail; } chan_waitq_t;
 ```
 
-所有操作（`waitq_push`、`waitq_pop`、`waitq_remove`）均定义为内联函数，在持锁状态下调用，时间复杂度 O(1)（`waitq_remove` 为 O(n)，但等待队列通常极短）。
+All operations (`waitq_push`, `waitq_pop`, `waitq_remove`) are defined as inline functions, called while holding the lock, with O(1) time complexity (`waitq_remove` is O(n), but the wait queue is usually extremely short).
 
 ---
 
-## 发送路径（`src/chan_send.c`）
+## Send Path (`src/chan_send.c`)
 
-### 无缓冲 channel（capacity == 0）
+### Unbuffered channel (capacity == 0)
 
 ```
 send(data):
   lock
   if closed → return CLOSED
-  if recv_waiters 非空:
+  if recv_waiters non-empty:
     r = pop(recv_waiters)
-    memcpy(r->data, data, elem_size)   ← 数据直接写入接收方缓冲区
+    memcpy(r->data, data, elem_size)   ← data written directly into receiver's buffer
     r->result = OK
     unlock
-    chan_park_wake(r->wake_park)        ← 唤醒接收方
+    chan_park_wake(r->wake_park)        ← wake the receiver
     return OK
   if try_send → return WOULDBLOCK
   push self to send_waiters
   unlock
-  park_wait(...)                        ← 阻塞
+  park_wait(...)                        ← block
   return self.result
 ```
 
-**关键设计**：数据在持锁时从发送方栈复制到接收方输出缓冲区，不经过任何中间存储，零额外拷贝。
+**Key design**: data is copied from the sender's stack into the receiver's output buffer while holding the lock, passing through no intermediate storage, with zero extra copies.
 
-### 有缓冲 channel（capacity > 0）
+### Buffered channel (capacity > 0)
 
 ```
 send(data):
   lock
   if closed → return CLOSED
-  if recv_waiters 非空 AND ring 为空:
-    直接交付（同无缓冲逻辑，跳过 ring buffer）
-  if ring 未满:
+  if recv_waiters non-empty AND ring is empty:
+    deliver directly (same as unbuffered logic, skipping the ring buffer)
+  if ring not full:
     ring_push(data)
-    if recv_waiters 非空 → pop & wake 一个接收方
+    if recv_waiters non-empty → pop & wake one receiver
     unlock; return OK
-  /* ring 已满 */
+  /* ring is full */
   if try_send → return WOULDBLOCK
   push self to send_waiters (self.data = &data)
-  unlock; park_wait(...)               ← 阻塞
-  /* 醒来后数据已由接收方推入 ring，见下文 */
+  unlock; park_wait(...)               ← block
+  /* after waking, the data has been pushed into the ring by the receiver, see below */
   return self.result
 ```
 
-**"接收方帮助推送"设计**：当接收方从 ring 中取出数据后，若发现有阻塞的发送方，它**持锁**直接将发送方的数据推入 ring，然后唤醒发送方通知"已完成"。发送方醒来后**无需重新加锁推送**，避免了"发送方在醒来后缓冲区可能再次被填满"的反复。
+**"Receiver helps push" design**: after the receiver takes data out of the ring, if it finds a blocked sender, it **holds the lock** and pushes the sender's data directly into the ring, then wakes the sender to signal "done." After waking, the sender **does not need to re-acquire the lock to push**, avoiding the back-and-forth of "the buffer may be filled again after the sender wakes."
 
-**避免丢唤醒（lost wakeup）**：无锁快路径与"注册等待者"之间存在竞态窗口——快路径可能在接收方检查完 ring（为空）、但其 `recv_waiter_cnt` 尚未对发送方可见时把数据推入 ring，导致发送方跳过唤醒、接收方抱着 ring 里的数据永久 park（紧耦合的两线程会直接死锁）。修复：
-- 等待方注册时用 `seq_cst` 自增计数，随后**在 park 前再查一次 ring**；
-- 快路径成功 push/pop 后插入一道 `seq_cst` fence，再查对端 `*_waiter_cnt`，若非零则取锁把数据交付给已 park 的等待方并唤醒。
+**Avoiding lost wakeup**: there is a race window between the lock-free fast path and "registering a waiter"—the fast path may push data into the ring after the receiver has checked the ring (empty) but before its `recv_waiter_cnt` is visible to the sender, causing the sender to skip the wake while the receiver holds the data in the ring and parks forever (two tightly coupled threads will deadlock outright). The fix:
+- when registering, the waiter increments a `seq_cst` counter, then **re-checks the ring once before parking**;
+- after a successful push/pop on the fast path, insert a `seq_cst` fence, then check the peer's `*_waiter_cnt`; if non-zero, acquire the lock to deliver the data to the already-parked waiter and wake it.
 
-两侧的 `seq_cst` fence 构成 StoreLoad（Dekker）屏障：**要么等待方注册后重查时看到数据，要么快路径重查时看到计数并唤醒它，二者不会同时错过**。代价是快路径每次成功操作多一道 fence（直连 send/recv 约 +7 ns/op；`chan_select` 路径不经过此处，不受影响）。所有交付点都会检查 `ring_pop` 的返回值——`ring_pop` 在 `!ring_empty` 之后仍可能因竞态返回 false，若忽略返回值直接以 `CHAN_OK` 唤醒接收方，会交付一条不存在的"幻象"消息。
+The `seq_cst` fences on both sides form a StoreLoad (Dekker) barrier: **either the waiter sees the data on its re-check after registering, or the fast path sees the count on its re-check and wakes it—the two cannot both be missed**. The cost is one extra fence per successful fast-path operation (about +7 ns/op for direct send/recv; the `chan_select` path does not go through here and is unaffected). Every delivery point checks the return value of `ring_pop`—`ring_pop` may still return false due to a race after `!ring_empty`, and if the return value is ignored and the receiver is woken with `CHAN_OK` regardless, it would deliver a nonexistent "phantom" message.
 
-详见 [`architecture.md`](architecture.md) 的 send/recv 快慢路径图。
-
----
-
-## SPSC 快速模式（`chan_create_spsc`）
-
-`chan_create_spsc(elem_size, capacity)` 创建一个**选择性加入**的单生产者单消费者通道。
-契约：**至多一个生产者线程 + 一个消费者线程**（违反即 UB）。满足契约时，它在并发流式
-负载下的吞吐可达默认 MPMC 通道的约 9 倍（i7-13700H 上 ~73 Mops vs ~8 Mops，持平
-Rust crossbeam）。它**不要求也不依赖 `chan_close`**——适合进程内长生命周期、永不关闭的
-线程间通道。
-
-**为什么快 —— 游标缓存（cursor caching）**：默认 MPMC ring 每次操作都要 acquire-load
-对端的热游标（生产者读 `cons.tail`、消费者读 `prod.tail`），而该游标被对端每次操作 release-
-store，于是每条消息都触发一次跨核 cache line 弹跳（在本机约 ~100 ns）。SPSC 模式让每一侧
-缓存对端游标的一个**下界**，仅当缓存显示"可能满/空"时才回读真实游标。单属主缓存
-（`prod.cached_cons_tail` 只被生产者读写，`cons.cached_prod_tail` 只被消费者读写）使得
-"槽位数据 happens-before 对端可见"链条保持完整——这正是 MPMC 下共享缓存**不**安全、而
-SPSC 下安全的根本原因。详见 `src/ring_lf.h` 的 SAFETY CONTRACT 与 `ring_spsc_push/pop`。
-
-**为什么省掉 per-op fence**：上一节的 Dekker 屏障要求快路径每次成功操作多一道 `seq_cst`
-fence（~+7 ns/op）。SPSC 模式在热路径上**省掉这道 fence**（生产者/消费者各只剩 relaxed
-的对端计数检查），把吞吐推过 Rust。代价是：一次 push/pop 若恰好与对端的"注册并 park"
-撞上 StoreLoad 竞态窗口（亚微秒级），可能漏掉这次唤醒。流式负载下"下一次 push/pop"就会
-补上；但在**请求/响应（ping-pong）**模式下，发起方在拿到响应前不会再发，漏唤醒会变成
-**永久死锁**。
-
-**park 侧有界重检（backstop）——在不依赖 close、不动热路径的前提下消除死锁**：无限等待的
-SPSC park **不**直接无限睡眠，而是先用一个有界超时 `LIBCHAN_SPSC_PARK_BACKSTOP_NS`
-（默认 1 ms）park；超时醒来后**持锁重检一次** ring：
-- 抓到那条漏唤醒的 push/pop → 取走，返回；
-- 通道已关闭 → 返回 CLOSED；
-- 确认仍空/满 → 重新入队并**无限 park**。
-
-正确性：竞态只属于"刚写入、尚在传播中"的等待计数；一旦重检确认对端状态未变，该计数已
-稳定可见远超任何传播延迟，**之后任意一次对端操作的 relaxed 读都必然看到它并唤醒**——因此
-此后的无限 park 安全，不再需要任何超时。净效果：每个 park 回合**至多多醒一次**（约 1 ms 后），
-随后静默；**不是轮询**。热路径（快路径自旋 + 无锁收发）一字未改，吞吐不受影响。该协议在
-send/recv 两侧对称实现，见 `src/chan_send.c` / `src/chan_recv.c` 的 `ch->spsc && timeout_ns < 0`
-分支。
-
-> 验证：ping-pong 死锁压测 400 万回合 + ASan/UBSan + TSan（0 data race）+ futex/pthread
-> 两种 park 后端；SPSC checksum cap=1/64/1024 各 ×30 零错误。
+See the send/recv fast/slow path diagrams in [`architecture.md`](architecture.md).
 
 ---
 
-## 接收路径（`src/chan_recv.c`）
+## SPSC Fast Mode (`chan_create_spsc`)
 
-### 无缓冲
+`chan_create_spsc(elem_size, capacity)` creates an **opt-in** single-producer single-consumer channel.
+Contract: **at most one producer thread + one consumer thread** (violation is UB). When the contract is satisfied, its throughput under concurrent streaming
+load can reach about 9x that of the default MPMC channel (~73 Mops vs ~8 Mops on an i7-13700H, matching
+Rust crossbeam). It **does not require or depend on `chan_close`**—suitable for in-process, long-lived, never-closed
+inter-thread channels.
 
-对称于发送路径：先检查 `send_waiters`，有则直接取数据并唤醒发送方；否则 park 等待。
+**Why it's fast — cursor caching**: the default MPMC ring must acquire-load
+the peer's hot cursor on every operation (the producer reads `cons.tail`, the consumer reads `prod.tail`), and that cursor is release-
+stored by the peer on every operation, so each message triggers one cross-core cache-line bounce (~100 ns on this machine). SPSC mode lets each side
+cache a **lower bound** of the peer's cursor, reading back the real cursor only when the cache indicates "possibly full/empty." Single-owner caches
+(`prod.cached_cons_tail` is read/written only by the producer, `cons.cached_prod_tail` only by the consumer) keep the
+"slot data happens-before peer visibility" chain intact—this is precisely the root reason why a shared cache is **not** safe under MPMC but
+is safe under SPSC. See the SAFETY CONTRACT in `src/ring_lf.h` and `ring_spsc_push/pop`.
 
-### 有缓冲
+**Why the per-op fence can be dropped**: the Dekker barrier from the previous section requires one extra `seq_cst`
+fence per successful fast-path operation (~+7 ns/op). SPSC mode **drops this fence** on the hot path (the producer/consumer are each left with only a relaxed
+peer-count check), pushing throughput past Rust. The cost: if a push/pop happens to hit the StoreLoad
+race window (sub-microsecond) against the peer's "register and park," it may miss that wake. Under streaming load, "the next push/pop"
+makes up for it; but in **request/response (ping-pong)** mode, the initiator will not send again before getting the response, so a missed wake becomes a
+**permanent deadlock**.
+
+**Park-side bounded recheck (backstop)—eliminating deadlock without depending on close or touching the hot path**: an indefinitely-waiting
+SPSC park does **not** sleep indefinitely outright; instead it first parks with a bounded timeout `LIBCHAN_SPSC_PARK_BACKSTOP_NS`
+(default 1 ms); after the timeout wakes it, it **rechecks the ring once while holding the lock**:
+- caught the missed-wake push/pop → take it, return;
+- channel already closed → return CLOSED;
+- confirmed still empty/full → re-enqueue and **park indefinitely**.
+
+Correctness: the race belongs only to a wait count that is "just written, still propagating"; once the recheck confirms the peer's state is unchanged, that count is
+stably visible far beyond any propagation delay, and **any subsequent relaxed read by a peer operation will necessarily see it and wake it**—so
+the subsequent indefinite park is safe and no longer needs any timeout. Net effect: each park round **wakes at most one extra time** (after ~1 ms),
+then goes silent; **this is not polling**. The hot path (fast-path spin + lock-free send/recv) is unchanged, and throughput is unaffected. This protocol is implemented symmetrically on
+the send/recv sides; see the `ch->spsc && timeout_ns < 0`
+branch in `src/chan_send.c` / `src/chan_recv.c`.
+
+> Verification: ping-pong deadlock stress test of 4 million rounds + ASan/UBSan + TSan (0 data races) + both futex/pthread
+> park backends; SPSC checksum cap=1/64/1024, ×30 each, zero errors.
+
+---
+
+## Receive Path (`src/chan_recv.c`)
+
+### Unbuffered
+
+Symmetric to the send path: first check `send_waiters`; if present, take the data directly and wake the sender; otherwise park and wait.
+
+### Buffered
 
 ```
 recv(out):
   lock
-  if ring 非空:
+  if ring non-empty:
     ring_pop(out)
-    if send_waiters 非空:
+    if send_waiters non-empty:
       s = pop(send_waiters)
-      ring_push(s->data)               ← 帮助发送方推入数据（持锁）
+      ring_push(s->data)               ← help the sender push the data (holding the lock)
       s->result = OK
       unlock
       wake(s->wake_park)
     else:
       unlock
     return OK
-  if send_waiters 非空:
-    直接从发送方取数据（同无缓冲逻辑）
+  if send_waiters non-empty:
+    take data directly from the sender (same as unbuffered logic)
   if closed → return CLOSED
   push self to recv_waiters; unlock; park
   return self.result
 ```
 
-**close 后排空语义**：`ring 非空` 的检查在 `closed` 检查之前，保证即使 channel 已关闭，ring buffer 中已有的数据也能被完整取走，与 Go `for v := range ch` 语义一致。
+**Drain-after-close semantics**: the `ring non-empty` check comes before the `closed` check, ensuring that even if the channel is already closed, data already in the ring buffer can be fully drained, consistent with Go's `for v := range ch` semantics.
 
 ---
 
-## Close 语义
+## Close Semantics
 
-`chan_close`（`src/chan_core.c`）：
+`chan_close` (`src/chan_core.c`):
 
 ```
 close():
   lock
   if already closed → return CHAN_ERR_CLOSED
   atomic_store(closed, true, release)
-  waitq_close_all(send_waiters)   ← 所有阻塞发送方：result = CLOSED, wake
-  waitq_close_all(recv_waiters)   ← 所有阻塞接收方：result = CLOSED, wake
+  waitq_close_all(send_waiters)   ← all blocked senders: result = CLOSED, wake
+  waitq_close_all(recv_waiters)   ← all blocked receivers: result = CLOSED, wake
   unlock
 ```
 
-`waitq_close_all` 对等待队列中每个 waiter 尝试 CAS（对于 select 存根），成功则设置 result 并唤醒。
+`waitq_close_all` attempts a CAS on each waiter in the wait queue (for select stubs); on success it sets the result and wakes it.
 
-**为何对有缓冲 channel 的阻塞接收方也直接唤醒返回 CLOSED？**  
-阻塞中的接收方意味着此刻 ring buffer 已空（否则它们不会阻塞），因此直接唤醒并通知 CLOSED 是正确的。
+**Why also directly wake blocked receivers on a buffered channel and return CLOSED?**  
+A blocked receiver means the ring buffer is empty at this moment (otherwise they would not be blocked), so directly waking and signaling CLOSED is correct.
 
 ---
 
-## 引用计数
+## Reference Counting
 
 ```
 chan_retain:  atomic_fetch_add(refcount, 1, relaxed)
 
 chan_destroy: if atomic_fetch_sub(refcount, 1, acq_rel) == 1:
-                lock(); unlock()   ← 排空屏障：确保没有线程仍在临界区
+                lock(); unlock()   ← drain barrier: ensure no thread is still in the critical section
                 free(buf); free(ch)
 ```
 
-`fetch_sub` 的 `acq_rel` 语义：
-- **release** 端：最后一个 `destroy` 调用者确保此前所有写操作对"做释放决定的那个线程"可见。
-- **acquire** 端：做释放决定的那个线程能看到所有其他线程在各自 `fetch_sub` 之前的写入，即所有已完成操作的结果。
+The `acq_rel` semantics of `fetch_sub`:
+- **release** side: the last `destroy` caller ensures all prior writes are visible to "the thread that makes the release decision."
+- **acquire** side: the thread that makes the release decision can see the writes of all other threads before their respective `fetch_sub`, i.e., the results of all completed operations.
 
-这是 `std::shared_ptr` / `Arc` 的标准引用计数内存序模式。
+This is the standard reference-counting memory-ordering pattern of `std::shared_ptr` / `Arc`.
 
 ---
 
-## Park 抽象（`src/park.c`）
+## Park Abstraction (`src/park.c`)
 
-`chan_park_t` 是线程睡眠/唤醒的底层原语，有两种实现：
+`chan_park_t` is the low-level primitive for thread sleep/wake, with two implementations:
 
-### Linux futex 实现（默认）
+### Linux futex implementation (default)
 
 ```c
 typedef struct { _Atomic uint32_t word; } chan_park_t;
 
 park_wait():
-  /* 自旋阶段：LIBCHAN_SPIN_LIMIT 次（默认 40） */
+  /* spin phase: LIBCHAN_SPIN_LIMIT times (default 40) */
   for i in 0..SPIN_LIMIT:
-    if word != 0 → return true   // 已被唤醒
+    if word != 0 → return true   // already woken
     if i < 8: PAUSE/YIELD        // x86: pause, ARM: yield
     else: sched_yield()
-  /* 进入内核 */
+  /* enter the kernel */
   syscall(FUTEX_WAIT, &word, 0, timeout)
   return word != 0
 
@@ -273,156 +273,156 @@ park_wake():
   syscall(FUTEX_WAKE, &word, 1)
 ```
 
-优势：`chan_park_t` 只占 4 字节（嵌入 waiter 节点），无额外堆分配；`FUTEX_WAKE` 内核路径比 `pthread_cond_signal` 更短。
+Advantages: `chan_park_t` occupies only 4 bytes (embedded in the waiter node), with no extra heap allocation; the `FUTEX_WAKE` kernel path is shorter than `pthread_cond_signal`.
 
-### POSIX pthread fallback（非 Linux 或强制启用时）
+### POSIX pthread fallback (non-Linux or when forced on)
 
 ```c
 typedef struct { pthread_mutex_t mu; pthread_cond_t cv; bool signaled; } chan_park_t;
 ```
 
-标准 mutex + condvar 模式，所有 POSIX 平台兼容。
+Standard mutex + condvar pattern, compatible with all POSIX platforms.
 
-### 自旋退避策略
+### Spin Backoff Strategy
 
-默认自旋 40 次：前 8 次用 CPU pause/yield 指令（x86: `PAUSE`，ARM: `YIELD`），延迟极低（约 10–40ns/次），对 L1 cache 几乎没有影响；后续用 `sched_yield()` 让出调度，避免空转浪费 CPU。
+By default spins 40 times: the first 8 use CPU pause/yield instructions (x86: `PAUSE`, ARM: `YIELD`), with extremely low latency (about 10–40ns each) and almost no impact on the L1 cache; subsequent iterations use `sched_yield()` to yield scheduling, avoiding wasting CPU on busy spinning.
 
-只有在自旋后仍未被唤醒，才陷入内核（futex/cond_wait），典型上下文切换约 1–5µs。
+Only if still not woken after spinning does it trap into the kernel (futex/cond_wait), with a typical context switch of about 1–5µs.
 
-设置 `LIBCHAN_SPIN_LIMIT=0` 可完全禁用自旋（适用于 CPU 核心紧张的嵌入式场景）。
+Setting `LIBCHAN_SPIN_LIMIT=0` fully disables spinning (suitable for embedded scenarios with tight CPU cores).
 
 ---
 
-## Select 多路复用（`src/select.c`）
+## Select Multiplexing (`src/select.c`)
 
-### 1. 锁顺序排序（防死锁）
+### 1. Lock-order sorting (deadlock prevention)
 
 ```c
-sort(cases, by=ch_pointer_value)   // 按 channel 地址升序
-lock_all(sorted_channels)          // 所有线程用相同顺序加锁 → 无死锁
+sort(cases, by=ch_pointer_value)   // ascending by channel address
+lock_all(sorted_channels)          // all threads lock in the same order → no deadlock
 ```
 
-所有并发的 `chan_select` 调用若涉及相同的 channel 集合，都会以相同的顺序加锁，因此不会形成死锁环。
+All concurrent `chan_select` calls involving the same set of channels lock in the same order, so they cannot form a deadlock cycle.
 
-### 2. 快路径（第一轮扫描）
+### 2. Fast path (first scan)
 
-持有所有锁时检查每个 case 是否立即可行。若有多个就绪，**均匀随机**选择一个（用 `rand() % nready`），避免某些 case 系统性地被饿死，与 Go select 规范的公平性要求一致。
+While holding all locks, check whether each case is immediately feasible. If multiple are ready, choose one **uniformly at random** (using `rand() % nready`), avoiding systematically starving certain cases, consistent with the fairness requirement of the Go select spec.
 
-执行选中 case，解锁所有 channel，返回 case 索引。
+Execute the chosen case, unlock all channels, and return the case index.
 
-### 3. 等待路径（第二轮，无就绪 case）
+### 3. Wait path (second round, no ready case)
 
-核心设计：**共享状态 + 存根节点（stub waiter）**
+Core design: **shared state + stub waiter**
 
 ```c
-_Atomic int  shared_state;   // 初始 WAITER_WAITING
-chan_park_t   shared_park;    // 所有存根唤醒时发信号到这里
+_Atomic int  shared_state;   // initially WAITER_WAITING
+chan_park_t   shared_park;    // all stubs signal here when woken
 
-chan_waiter_t stubs[n];       // 栈分配，每个 case 一个
+chan_waiter_t stubs[n];       // stack-allocated, one per case
 for each case i:
     stubs[i].select_state = &shared_state
     stubs[i].wake_park    = &shared_park
     register stubs[i] on cases[i].ch's queue
 unlock_all
-park_wait(&shared_park, timeout)   // 只有一个睡眠点
+park_wait(&shared_park, timeout)   // a single sleep point
 ```
 
-### 4. CAS 抢占协议
+### 4. CAS claim protocol
 
-当某个 channel 准备唤醒一个等待者时（send/recv 路径中的 `waitq_pop_sender/receiver`），会调用 `waiter_try_claim`：
+When a channel is ready to wake a waiter (`waitq_pop_sender/receiver` in the send/recv path), it calls `waiter_try_claim`:
 
 ```c
 bool waiter_try_claim(chan_waiter_t *w):
-    if w->select_state == NULL: return true   // 普通等待者，直接领取
-    CAS(w->select_state, WAITING → WOKEN)     // select 存根：原子竞争
+    if w->select_state == NULL: return true   // normal waiter, claim directly
+    CAS(w->select_state, WAITING → WOKEN)     // select stub: atomic race
     return success
 ```
 
-- **CAS 成功（第一个赢得者）**：正常交付数据，调用 `chan_park_wake(w->wake_park)` 唤醒共享 park。
-- **CAS 失败（已被其他 channel 抢先）**：存根被无害丢弃（已从队列弹出，select 调用方在清理阶段会发现它不在队列中），不进行数据交付。
+- **CAS success (first winner)**: deliver data normally and call `chan_park_wake(w->wake_park)` to wake the shared park.
+- **CAS failure (already claimed by another channel)**: the stub is harmlessly discarded (already popped from the queue; the select caller will find it not in the queue during cleanup), and no data delivery is performed.
 
-这保证了即使多个 channel 几乎同时就绪，select 调用方只被唤醒一次，且只有一个 channel 的操作真正完成。
+This guarantees that even if multiple channels become ready almost simultaneously, the select caller is woken only once, and only one channel's operation actually completes.
 
-### 5. 胜者识别与清理
+### 5. Winner identification and cleanup
 
 ```c
 lock_all
 for each stub i:
     if stubs[i].result != CHAN_ERR_WOULDBLOCK:
-        winner = i                    // 唤醒方设置了 result（仅胜者会设置）
+        winner = i                    // the waker set the result (only the winner does)
     else:
-        waitq_remove(cases[i].ch, &stubs[i])   // 仍在队列中，移除；已被丢弃的无影响
+        waitq_remove(cases[i].ch, &stubs[i])   // still in the queue, remove; no effect if already discarded
 unlock_all
 ```
 
-胜者 stub 的 `result` 已被唤醒方设为 `CHAN_OK` 或 `CHAN_ERR_CLOSED`；其他 stub 的 `result` 保持初始值 `CHAN_ERR_WOULDBLOCK`，这是识别胜者的可靠标志。
+The winner stub's `result` has been set to `CHAN_OK` or `CHAN_ERR_CLOSED` by the waker; the other stubs' `result` retains the initial value `CHAN_ERR_WOULDBLOCK`, which is a reliable marker for identifying the winner.
 
-### 6. 已知限制：有缓冲通道上的延迟唤醒
+### 6. Known limitation: delayed wakeup on buffered channels
 
-为避免 MPMC 串行化，select 存根**不增加** `send_waiter_cnt`/`recv_waiter_cnt`（增加会让所有线程在任何 select park 时立即放弃无锁快路径，实测把吞吐打到 <1 Mops/s）。代价是：**一个 park 在有缓冲通道上的 select 等待者，不会被该通道上的无锁快路径操作及时唤醒**。它只会在以下时机被唤醒：
+To avoid MPMC serialization, select stubs **do not increment** `send_waiter_cnt`/`recv_waiter_cnt` (incrementing would make all threads immediately give up the lock-free fast path whenever any select parks, which measured down to <1 Mops/s in throughput). The cost is: **a select waiter parked on a buffered channel will not be woken promptly by lock-free fast-path operations on that channel**. It is only woken at the following moments:
 
-- 环被填满/取空到某个线程改走慢路径（慢路径会检查等待队列并交付）——延迟有界于环容量；或
-- 通道被 `chan_close`（`waitq_close_all` 唤醒全部存根）。
+- the ring is filled/drained until some thread switches to the slow path (the slow path checks the wait queue and delivers)—latency is bounded by the ring capacity; or
+- the channel is `chan_close`'d (`waitq_close_all` wakes all stubs).
 
-**正常的持续流量下这只是"批处理延迟"**（生产者无锁灌满环 → 一次唤醒 → 消费者批量取走，这正是 select 高吞吐的来源）。
+**Under normal sustained traffic this is just "batching latency"** (the producer fills the ring lock-free → one wake → the consumer drains in batch, which is precisely the source of select's high throughput).
 
-**但有一个病态场景会永久卡住**：生产者用 select/send 向有缓冲通道发**少量**数据（不足以填满环），随后**永久沉默且不 `chan_close`**——此时 park 在该通道上的 select 消费者会一直收不到这些数据。
+**But there is one pathological scenario that hangs permanently**: a producer uses select/send to send a **small** amount of data (not enough to fill the ring) to a buffered channel, then **goes silent forever and does not `chan_close`**—at which point a select consumer parked on that channel never receives this data.
 
-> **规避**：用 `chan_close` 表示"发送完毕"（Go 的通用惯例)。close 一定会唤醒所有 park 的 select，彻底规避此问题。实践中几乎所有 select 用法都以 close 收尾，因此该限制极少触及。
+> **Workaround**: use `chan_close` to indicate "done sending" (Go's general convention). close always wakes all parked selects, fully avoiding this problem. In practice nearly all select usage ends with close, so this limitation is rarely hit.
 >
-> 直连 `chan_send`/`chan_recv`（非 select）**不受此限制**——它们的等待者增加 waiter 计数 + `seq_cst` 握手，会被及时唤醒（见上文发送路径的"避免丢唤醒"小节）。彻底修复 select 的延迟唤醒需要在不破坏批处理快路径的前提下唤醒存根，是一项独立的设计工作。
+> Direct `chan_send`/`chan_recv` (non-select) **are not subject to this limitation**—their waiters increment the waiter count + `seq_cst` handshake and are woken promptly (see the "Avoiding lost wakeup" subsection in the send path above). Fully fixing select's delayed wakeup requires waking stubs without breaking the batching fast path, which is a separate piece of design work.
 
-### 7. 已知限制：select MPMC 下的微小计数偏差
+### 7. Known limitation: tiny count skew under select MPMC
 
-在 **≥2 生产者 + 2 消费者**且全部走 select 的高竞争场景下，存在约 **0.01% 的计数偏差**（收到条数略多于发送条数）。根因：`execute_case_locked` 的 SEND 分支在 `ring_push` 成功后会唤醒一个 park 的接收存根并置 `result=CHAN_OK`，但数据其实进了环（由其他消费者弹出），被唤醒的存根却把这次唤醒当作"收到一条"计入——形成一次重复计数。
+Under a high-contention scenario of **≥2 producers + 2 consumers** all going through select, there is an approximately **0.01% count skew** (slightly more received than sent). Root cause: the SEND branch of `execute_case_locked`, after a successful `ring_push`, wakes a parked receive stub and sets `result=CHAN_OK`, but the data actually went into the ring (popped by another consumer), while the woken stub treats this wake as "received one" and counts it—forming a duplicate count.
 
-这与 §6 的有界延迟唤醒协议**深度耦合**：要彻底修复需重做 select 的唤醒/认领协议（曾尝试，导致死锁 + 吞吐下降 2–3×，已回退）。鉴于偏差极小（0.01%）、仅影响精确计数而非吞吐量级、且只在"全 select 的 MPMC"下出现，当前**记录为已知限制**而非强行修复。
+This is **deeply coupled** with the bounded delayed-wakeup protocol of §6: a complete fix would require redoing select's wake/claim protocol (attempted before, causing deadlock + a 2–3× throughput drop, since reverted). Given that the skew is extremely small (0.01%), affects only exact counting rather than throughput order-of-magnitude, and appears only under "all-select MPMC," it is currently **recorded as a known limitation** rather than forcibly fixed.
 
-> **不受影响**：直连 `chan_send`/`chan_recv` 在任意 MPMC 配置下计数精确（已用固定消息数基准 120/120 组验证）；单生产单消费（SPSC）的 select 也精确。
+> **Not affected**: direct `chan_send`/`chan_recv` count exactly under any MPMC configuration (verified with a fixed-message-count benchmark, 120/120 groups); single-producer single-consumer (SPSC) select is also exact.
 
 ---
 
-## 内存序速查
+## Memory Ordering Cheat Sheet
 
-| 操作 | 内存序 | 理由 |
+| Operation | Memory ordering | Rationale |
 |------|--------|------|
-| `closed` 写（`chan_close`） | `memory_order_release` | 确保关闭前的写入对观察到 `closed=true` 的线程可见 |
-| `closed` 读（`chan_is_closed` 及 send/recv 快路径） | `memory_order_acquire` | 与 release 端配对 |
-| `select_state` CAS | `acq_rel`（成功）/ `relaxed`（失败） | 成功时需要 acquire+release 两向同步；失败时只需知道当前值 |
-| `refcount` fetch_sub | `memory_order_acq_rel` | 使最后一个 destroy 能看到所有前驱线程的写入 |
-| `refcount` fetch_add | `memory_order_relaxed` | 计数本身是原子的，不需要额外 ordering |
-| futex word | `memory_order_release`（写）/ `memory_order_acquire`（读） | futex 系统调用本身提供内核级屏障 |
-| lock 保护区内的字段 | 普通读写 | pthread_mutex 的 acquire/release 语义已提供全量内存序保证 |
+| `closed` write (`chan_close`) | `memory_order_release` | ensures writes before close are visible to threads observing `closed=true` |
+| `closed` read (`chan_is_closed` and send/recv fast path) | `memory_order_acquire` | pairs with the release side |
+| `select_state` CAS | `acq_rel` (success) / `relaxed` (failure) | success needs bidirectional acquire+release sync; failure only needs the current value |
+| `refcount` fetch_sub | `memory_order_acq_rel` | lets the last destroy see the writes of all predecessor threads |
+| `refcount` fetch_add | `memory_order_relaxed` | the count itself is atomic and needs no extra ordering |
+| futex word | `memory_order_release` (write) / `memory_order_acquire` (read) | the futex syscall itself provides a kernel-level barrier |
+| fields inside the lock-protected region | plain reads/writes | pthread_mutex's acquire/release semantics already provide full memory-ordering guarantees |
 
 ---
 
-## 性能数据（参考值）
+## Performance Data (reference values)
 
-测试环境：WSL2（Linux 6.6，x86-64），`RelWithDebInfo`，`LIBCHAN_SPIN_LIMIT=40`，100 万条消息：
+Test environment: WSL2 (Linux 6.6, x86-64), `RelWithDebInfo`, `LIBCHAN_SPIN_LIMIT=40`, 1 million messages:
 
-| 模式 | 线程对数 | 容量 | 吞吐量 |
+| Mode | Thread pairs | Capacity | Throughput |
 |------|----------|------|--------|
-| 无缓冲 | 1 | 0 | ~3.5 Mops/s |
-| 有缓冲 | 1 | 1024 | ~5.0 Mops/s |
-| 有缓冲 | 2 | 64 | ~4.9 Mops/s |
-| 有缓冲 | 2 | 1024 | ~9.7 Mops/s |
-| 有缓冲 | 4 | 1024 | ~6.3 Mops/s |
+| unbuffered | 1 | 0 | ~3.5 Mops/s |
+| buffered | 1 | 1024 | ~5.0 Mops/s |
+| buffered | 2 | 64 | ~4.9 Mops/s |
+| buffered | 2 | 1024 | ~9.7 Mops/s |
+| buffered | 4 | 1024 | ~6.3 Mops/s |
 
-可用 `make bench` 在本机重跑（输出 Mops/sec 表格）。
+Use `make bench` to re-run on your own machine (outputs a Mops/sec table).
 
 ---
 
-## 源文件导航
+## Source File Navigation
 
-| 文件 | 职责 |
+| File | Responsibility |
 |------|------|
-| `include/libchan.h` | 公开 ABI：所有类型、函数声明 |
-| `src/libchan_internal.h` | 内部数据结构、内联函数、park 声明 |
+| `include/libchan.h` | public ABI: all types, function declarations |
+| `src/libchan_internal.h` | internal data structures, inline functions, park declarations |
 | `src/chan_core.c` | `chan_create` / `chan_destroy` / `chan_retain` / `chan_close` |
-| `src/chan_send.c` | `chan_send_impl`（三种变体的统一入口） |
+| `src/chan_send.c` | `chan_send_impl` (unified entry for the three variants) |
 | `src/chan_recv.c` | `chan_recv_impl` |
-| `src/select.c` | `chan_select_impl`（含锁序排序、CAS 抢占） |
-| `src/park.c` | futex 与 pthread condvar 两种 park 实现 |
-| `src/util.c` | `chan_spin_hint`（CPU pause/yield 内联汇编） |
-| `src/ring_buffer.c` | 编译单元占位（逻辑内联于 `libchan_internal.h`） |
-| `src/waitq.c` | 编译单元占位（逻辑内联于 `libchan_internal.h`） |
+| `src/select.c` | `chan_select_impl` (includes lock-order sorting, CAS claim) |
+| `src/park.c` | futex and pthread condvar park implementations |
+| `src/util.c` | `chan_spin_hint` (CPU pause/yield inline assembly) |
+| `src/ring_buffer.c` | compilation-unit placeholder (logic inlined in `libchan_internal.h`) |
+| `src/waitq.c` | compilation-unit placeholder (logic inlined in `libchan_internal.h`) |

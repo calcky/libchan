@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # run_park_cmp.sh
 #
-# 分别以 futex 和 pthread 两种 park 后端构建 libchan，
-# 运行 bench_lock_overhead，并排对比结果。
+# Build libchan with each of the two park backends (futex and pthread),
+# run bench_lock_overhead, and compare the results side by side.
 #
-# 用法：
-#   bash bench/run_park_cmp.sh              # 仅打印
-#   bash bench/run_park_cmp.sh --save       # 同时写入 doc/benchmarks.md
+# Usage:
+#   bash bench/run_park_cmp.sh              # print only
+#   bash bench/run_park_cmp.sh --save       # also write to doc/benchmarks.md
 #
-# 要求：cmake、make、gcc 已在 PATH 中。
+# Requires: cmake, make, gcc must be on PATH.
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ BUILD_PTHREAD="$ROOT/build-park-pthread"
 SAVE=0
 [ "${1:-}" = "--save" ] && SAVE=1
 
-# ---- 构建两种配置 ----
+# ---- build both configurations ----
 build_variant() {
     local dir="$1" force_pthread="$2"
     cmake -B "$dir" -S "$ROOT" \
@@ -36,13 +36,13 @@ build_variant() {
         > /dev/null 2>&1
 }
 
-echo "构建 futex 版本 ..." >&2
+echo "Building futex version ..." >&2
 build_variant "$BUILD_FUTEX"  "OFF"
-echo "构建 pthread 版本 ..." >&2
+echo "Building pthread version ..." >&2
 build_variant "$BUILD_PTHREAD" "ON"
 
-# ---- 运行并捕获输出（只保留数据行）----
-# 过滤掉空行和纯分隔行，保留标题行和数据行
+# ---- run and capture output (keep only data rows) ----
+# filter out blank lines and pure separator rows, keep the header and data rows
 run_and_filter() {
     "$1/bench/bench_lock_overhead" 2>/dev/null \
         | grep -v '^[[:space:]]*$' \
@@ -53,13 +53,13 @@ TMP_F="$(mktemp)"
 TMP_P="$(mktemp)"
 trap 'rm -f "$TMP_F" "$TMP_P"' EXIT
 
-echo "运行 futex ..." >&2
+echo "Running futex ..." >&2
 run_and_filter "$BUILD_FUTEX"  > "$TMP_F"
-echo "运行 pthread ..." >&2
+echo "Running pthread ..." >&2
 run_and_filter "$BUILD_PTHREAD" > "$TMP_P"
 
-# ---- 并排输出 ----
-COL=52   # 左列宽度
+# ---- side-by-side output ----
+COL=52   # left column width
 
 format_row() {
     local left="$1" right="$2"
@@ -70,10 +70,10 @@ HEADER_LEFT="futex (Linux syscall)"
 HEADER_RIGHT="pthread (mutex+condvar)"
 
 OUTPUT=""
-OUTPUT+="$(format_row "场景" "futex ns/op    Mops/s    pthread ns/op    Mops/s")"$'\n'
+OUTPUT+="$(format_row "scenario" "futex ns/op    Mops/s    pthread ns/op    Mops/s")"$'\n'
 OUTPUT+="$(printf '%0.s-' {1..90})"$'\n'
 
-# 逐行对比（行数可能不一致，用 paste 对齐）
+# compare line by line (line counts may differ, align with paste)
 while IFS= read -r line; do
     OUTPUT+="$line"$'\n'
 done < <(paste -d'|' "$TMP_F" "$TMP_P" \
@@ -83,26 +83,26 @@ done < <(paste -d'|' "$TMP_F" "$TMP_P" \
 
 echo ""
 echo "======================================================================"
-echo "  libchan Park 后端对比：futex vs pthread"
+echo "  libchan park backend comparison: futex vs pthread"
 echo "======================================================================"
 printf "  %-48s  %s\n" "[ futex ]" "[ pthread ]"
 echo "----------------------------------------------------------------------"
 paste "$TMP_F" "$TMP_P" | awk -F'\t' '{printf "  %-50s  %s\n", $1, $2}'
 echo ""
 
-# ---- 可选：写入 doc/benchmarks.md ----
+# ---- optional: write to doc/benchmarks.md ----
 if [ "$SAVE" -eq 1 ]; then
     DOC="$ROOT/doc/benchmarks.md"
     {
         echo ""
-        echo "## 1. Park 后端对比：futex vs pthread"
+        echo "## 1. Park backend comparison: futex vs pthread"
         echo ""
         echo '```'
-        echo "构建配置：LIBCHAN_SPIN_LIMIT=40，-O3，$(uname -r)"
+        echo "build config: LIBCHAN_SPIN_LIMIT=40, -O3, $(uname -r)"
         printf "  %-50s  %s\n" "[ futex ]" "[ pthread ]"
         echo "----------------------------------------------------------------------"
         paste "$TMP_F" "$TMP_P" | awk -F'\t' '{printf "  %-50s  %s\n", $1, $2}'
         echo '```'
     } >> "$DOC"
-    echo "已追加到 $DOC" >&2
+    echo "Appended to $DOC" >&2
 fi

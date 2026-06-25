@@ -58,7 +58,7 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
             }
             /* ring full */
             if (spin >= LIBCHAN_FASTPATH_SPIN) break;
-            chan_spin_hint(spin & 7);  /* 纯 pause,不 yield */
+            chan_spin_hint(spin & 7);  /* pure pause, no yield */
         }
         /* fall through to the locked slow path */
     }

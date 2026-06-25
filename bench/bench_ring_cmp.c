@@ -1,18 +1,22 @@
 /*
  * bench_ring_cmp.c
  *
- * 量化 DPDK 4-游标 rte_ring 与 Vyukov per-slot MPMC 的吞吐差距。
+ * Quantify the throughput gap between the DPDK 4-cursor rte_ring and the
+ * Vyukov per-slot MPMC queue.
  *
- * DPDK rte_ring：Phase 3 需自旋等待 prod.tail == 本轮预约位置后才能提交，
- * 多个并发生产者的提交串行化（convoy 效应）。
+ * DPDK rte_ring: in Phase 3 a producer must spin-wait until prod.tail equals
+ * its reserved position before it can commit, which serializes the commits of
+ * concurrent producers (convoy effect).
  *
- * Vyukov per-slot：每个槽独立持有 _Atomic uint64_t seq，生产者写完后直接
- * store_release 该槽的 seq，无跨生产者的 Phase 3 等待。
+ * Vyukov per-slot: each slot owns an independent _Atomic uint64_t seq; after
+ * writing, a producer directly store_releases that slot's seq, with no
+ * cross-producer Phase 3 wait.
  *
- * 关键变量：
- *   - 线程数：1P1C / 2P2C / 4P4C / 8P8C
- *   - 元素大小：8 B（int64）和 64 B（一条 cache line）
- *     元素越大 Phase 2 memcpy 越慢 → rte_ring Phase 3 convoy 越严重
+ * Key variables:
+ *   - thread count: 1P1C / 2P2C / 4P4C / 8P8C
+ *   - element size: 8 B (int64) and 64 B (one cache line)
+ *     larger elements make Phase 2 memcpy slower -> rte_ring Phase 3 convoy
+ *     gets worse
  */
 
 #define _GNU_SOURCE
@@ -27,7 +31,7 @@
 #include <time.h>
 
 /* ------------------------------------------------------------------ */
-/* 计时                                                                 */
+/* timing                                                              */
 /* ------------------------------------------------------------------ */
 
 static inline int64_t now_ns(void) {
@@ -37,7 +41,7 @@ static inline int64_t now_ns(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 自旋提示                                                             */
+/* spin hint                                                           */
 /* ------------------------------------------------------------------ */
 
 static inline void spin_hint(void) {
@@ -49,7 +53,7 @@ static inline void spin_hint(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* DPDK 4-游标 rte_ring（与 src/ring_lf.c 相同逻辑，inline 实现）      */
+/* DPDK 4-cursor rte_ring (same logic as src/ring_lf.c, inline impl)   */
 /* ------------------------------------------------------------------ */
 
 #define RING_ALIGNED __attribute__((aligned(64)))
@@ -64,7 +68,7 @@ typedef struct {
 } dpdk_ring_t;
 
 static bool dpdk_init(dpdk_ring_t *r, size_t cap, size_t elem_size) {
-    /* 向上取整为 2 的幂 */
+    /* round up to a power of two */
     uint32_t n = (uint32_t)cap - 1;
     n |= n >> 1; n |= n >> 2; n |= n >> 4; n |= n >> 8; n |= n >> 16;
     n++;
@@ -77,7 +81,7 @@ static bool dpdk_init(dpdk_ring_t *r, size_t cap, size_t elem_size) {
 }
 static void dpdk_destroy(dpdk_ring_t *r) { free(r->slots); }
 
-/* 阻塞式 push（满时自旋等待）*/
+/* blocking push (spin-wait when full) */
 static void dpdk_push_wait(dpdk_ring_t *r, const void *data) {
     uint32_t ph, pnext;
     for (;;) {
@@ -89,15 +93,15 @@ static void dpdk_push_wait(dpdk_ring_t *r, const void *data) {
                 memory_order_relaxed, memory_order_relaxed))
             break;
     }
-    /* Phase 2: 写数据 */
+    /* Phase 2: write data */
     memcpy(r->slots + (ph & r->mask) * r->elem_size, data, r->elem_size);
-    /* Phase 3: 等待前驱提交，再推进 prod.tail */
+    /* Phase 3: wait for the predecessor to commit, then advance prod.tail */
     while (atomic_load_explicit(&r->prod.tail, memory_order_relaxed) != ph)
         spin_hint();
     atomic_store_explicit(&r->prod.tail, pnext, memory_order_release);
 }
 
-/* 阻塞式 pop（空时自旋等待）*/
+/* blocking pop (spin-wait when empty) */
 static void dpdk_pop_wait(dpdk_ring_t *r, void *out) {
     uint32_t ch, cnext;
     for (;;) {
@@ -125,7 +129,7 @@ typedef struct {
     size_t            elem_size;
     _Atomic uint64_t  prod_head;
     _Atomic uint64_t  cons_head;
-    _Atomic uint64_t *seqs;    /* per-slot 序列号，初始化为 i */
+    _Atomic uint64_t *seqs;    /* per-slot sequence number, initialized to i */
     char             *slots;
 } vy_ring_t;
 
@@ -146,12 +150,15 @@ static bool vy_init(vy_ring_t *r, size_t cap, size_t elem_size) {
 static void vy_destroy(vy_ring_t *r) { free(r->seqs); free(r->slots); }
 
 /*
- * Vyukov push 逻辑：
- *   pos 是本线程预约的写入位置。
- *   seq == pos → 槽空闲可写；seq < pos → 槽被占用（满）；seq > pos → CAS 失败需重载
+ * Vyukov push logic:
+ *   pos is the write position this thread has reserved.
+ *   seq == pos -> slot free, writable; seq < pos -> slot occupied (full);
+ *   seq > pos -> CAS failed, reload.
  *
- * 写完后 store_release(seq, pos+1)，消费者看到 seq == pos+1 时读取数据。
- * 关键：不存在跨生产者的 Phase 3 自旋，每个生产者独立提交自己的槽。
+ * After writing, store_release(seq, pos+1); the consumer reads the data once
+ * it sees seq == pos+1.
+ * Key point: there is no cross-producer Phase 3 spin; each producer commits
+ * its own slot independently.
  */
 static void vy_push_wait(vy_ring_t *r, const void *data) {
     uint64_t pos = atomic_load_explicit(&r->prod_head, memory_order_relaxed);
@@ -162,27 +169,30 @@ static void vy_push_wait(vy_ring_t *r, const void *data) {
         if (diff == 0) {
             if (atomic_compare_exchange_weak_explicit(&r->prod_head, &pos, pos + 1,
                     memory_order_relaxed, memory_order_relaxed))
-                break;          /* 成功预约 */
-            /* CAS 失败：另一生产者抢先，pos 已被更新为 expected 的新值，继续 */
+                break;          /* reservation succeeded */
+            /* CAS failed: another producer got ahead; pos has been updated to
+               the new expected value, continue */
         } else if (diff < 0) {
-            /* 满：等待消费者释放 */
+            /* full: wait for a consumer to release */
             spin_hint();
             pos = atomic_load_explicit(&r->prod_head, memory_order_relaxed);
         } else {
-            /* diff > 0：另一生产者已拿走此槽，重载 pos */
+            /* diff > 0: another producer already took this slot, reload pos */
             pos = atomic_load_explicit(&r->prod_head, memory_order_relaxed);
         }
     }
     memcpy(r->slots + (pos & r->mask) * r->elem_size, data, r->elem_size);
-    /* 提交：让消费者看到 seq == pos + 1 */
+    /* commit: let the consumer see seq == pos + 1 */
     atomic_store_explicit(&r->seqs[pos & r->mask], pos + 1, memory_order_release);
 }
 
 /*
- * Vyukov pop 逻辑：
- *   seq == pos+1 → 数据就绪；seq < pos+1 → 空；seq > pos+1 → CAS 失败需重载
+ * Vyukov pop logic:
+ *   seq == pos+1 -> data ready; seq < pos+1 -> empty;
+ *   seq > pos+1 -> CAS failed, reload.
  *
- * 读完后 store_release(seq, pos + capacity)，让下一轮生产者看到槽空闲。
+ * After reading, store_release(seq, pos + capacity) so the next-round producer
+ * sees the slot as free.
  */
 static void vy_pop_wait(vy_ring_t *r, void *out) {
     uint64_t pos = atomic_load_explicit(&r->cons_head, memory_order_relaxed);
@@ -202,27 +212,27 @@ static void vy_pop_wait(vy_ring_t *r, void *out) {
         }
     }
     memcpy(out, r->slots + (pos & r->mask) * r->elem_size, r->elem_size);
-    /* 释放槽：下一轮生产者在 pos + capacity 时预约此槽 */
+    /* release the slot: the next-round producer reserves it at pos + capacity */
     atomic_store_explicit(&r->seqs[pos & r->mask],
                           pos + r->capacity, memory_order_release);
 }
 
 /* ------------------------------------------------------------------ */
-/* 基准框架                                                             */
+/* benchmark framework                                                 */
 /* ------------------------------------------------------------------ */
 
 #define RING_CAP   1024
-#define TOTAL_OPS  4000000L   /* 每次测试总 send+recv 次数 */
+#define TOTAL_OPS  4000000L   /* total send+recv count per test */
 #define WARMUP_OPS  200000L
 
 typedef enum { IMPL_DPDK, IMPL_VYUKOV } impl_t;
 
 typedef struct {
     impl_t        impl;
-    void         *ring;      /* dpdk_ring_t* 或 vy_ring_t* */
+    void         *ring;      /* dpdk_ring_t* or vy_ring_t* */
     size_t        elem_size;
-    _Atomic long  sent;      /* 全局已发送计数 */
-    _Atomic long  recvd;     /* 全局已接收计数 */
+    _Atomic long  sent;      /* global sent count */
+    _Atomic long  recvd;     /* global received count */
     long          target;
 } bench_state_t;
 
@@ -232,7 +242,8 @@ static void *producer_fn(void *arg) {
     for (;;) {
         long idx = atomic_fetch_add_explicit(&s->sent, 1, memory_order_relaxed);
         if (idx >= s->target) break;
-        /* 写入序号到 buf 头部（用于检验正确性时可扩展） */
+        /* write the sequence number into the head of buf (extensible for
+           correctness checking) */
         memcpy(buf, &idx, sizeof(idx));
         if (s->impl == IMPL_DPDK)
             dpdk_push_wait((dpdk_ring_t *)s->ring, buf);
@@ -256,7 +267,7 @@ static void *consumer_fn(void *arg) {
     return NULL;
 }
 
-/* 返回吞吐量 Mops/s */
+/* returns throughput in Mops/s */
 static double run_bench(impl_t impl, void *ring, size_t elem_size,
                         int nprод, int ncons, long total) {
     bench_state_t s = {
@@ -294,12 +305,12 @@ int main(void) {
     const int ntc = (int)(sizeof(thread_counts) / sizeof(thread_counts[0]));
     const int nes = (int)(sizeof(elem_sizes)    / sizeof(elem_sizes[0]));
 
-    printf("CPU: rte_ring (DPDK 4-游标) vs Vyukov per-slot MPMC\n");
-    printf("环容量: %d  总操作数: %ldM/测试  每次操作=push+pop\n\n",
+    printf("CPU: rte_ring (DPDK 4-cursor) vs Vyukov per-slot MPMC\n");
+    printf("ring capacity: %d  total ops: %ldM/test  one op=push+pop\n\n",
            RING_CAP, TOTAL_OPS / 1000000L);
 
     printf("%-14s  %-6s  %12s  %12s  %8s\n",
-           "场景", "elem", "DPDK Mops/s", "Vyukov Mops/s", "Vyukov/DPDK");
+           "scenario", "elem", "DPDK Mops/s", "Vyukov Mops/s", "Vyukov/DPDK");
     printf("%-14s  %-6s  %12s  %12s  %8s\n",
            "--------------", "------",
            "------------", "-------------", "----------");
@@ -309,13 +320,13 @@ int main(void) {
         for (int ti = 0; ti < ntc; ti++) {
             int np = thread_counts[ti];
 
-            /* 初始化两种 ring */
+            /* initialize both rings */
             dpdk_ring_t dr; vy_ring_t vr;
             if (!dpdk_init(&dr, RING_CAP, esz) || !vy_init(&vr, RING_CAP, esz)) {
                 fprintf(stderr, "ring init failed\n"); return 1;
             }
 
-            /* warmup（用 DPDK ring，两种都需要预热 CPU 缓存）*/
+            /* warmup (use the DPDK ring; both need to warm the CPU cache) */
             bench_state_t ws = { .impl=IMPL_DPDK, .ring=&dr, .elem_size=esz,
                                   .target=WARMUP_OPS };
             atomic_init(&ws.sent, 0); atomic_init(&ws.recvd, 0);
@@ -342,10 +353,13 @@ int main(void) {
         if (ei < nes - 1) printf("\n");
     }
 
-    printf("\n说明:\n");
-    printf("  DPDK Phase 3 自旋：当 N 个生产者并发预约后，第 k 个生产者必须等前 k-1 个\n");
-    printf("  提交完才能推进 prod.tail（串行 convoy）。\n");
-    printf("  Vyukov per-slot：每个生产者独立写槽后直接 store_release 本槽 seq，无等待。\n");
-    printf("  元素越大（Phase 2 memcpy 越长），convoy 窗口越宽，DPDK 劣势越明显。\n");
+    printf("\nNotes:\n");
+    printf("  DPDK Phase 3 spin: after N producers reserve concurrently, the k-th\n");
+    printf("  producer must wait for the first k-1 to commit before it can advance\n");
+    printf("  prod.tail (serial convoy).\n");
+    printf("  Vyukov per-slot: each producer writes its slot and directly\n");
+    printf("  store_releases that slot's seq, with no wait.\n");
+    printf("  The larger the element (the longer the Phase 2 memcpy), the wider the\n");
+    printf("  convoy window and the more pronounced DPDK's disadvantage.\n");
     return 0;
 }

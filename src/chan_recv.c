@@ -47,7 +47,7 @@ chan_err_t chan_recv_impl(chan_t *ch, void *out, int64_t timeout_ns) {
             /* ring empty */
             if (atomic_load_explicit(&ch->closed, memory_order_acquire)) break;
             if (spin >= LIBCHAN_FASTPATH_SPIN) break;
-            chan_spin_hint(spin & 7);  /* 纯 pause,不 yield */
+            chan_spin_hint(spin & 7);  /* pure pause, no yield */
         }
         /* fall through to the locked slow path */
     }

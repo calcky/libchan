@@ -1,14 +1,19 @@
 /*
  * bench_lock_overhead.c
  *
- * 通过对比以下四种实现，量化锁对 channel 吞吐的影响：
- *   1. 基线：无锁的裸内存拷贝（纯 memcpy，单线程）
- *   2. 原子计数：仅用一个 atomic_fetch_add，无 mutex（代表 lock-free 理论上界）
- *   3. 无竞争 mutex：单线程持续 lock→操作→unlock（测 mutex 本身开销）
- *   4. libchan try_send/try_recv 对（真实 channel，单线程无等待路径）
- *   5. libchan 阻塞 send/recv（双线程，涉及真实 park/unpark，代表完整路径）
+ * Quantify the impact of locking on channel throughput by comparing the
+ * following implementations:
+ *   1. baseline: lock-free raw memory copy (pure memcpy, single-threaded)
+ *   2. atomic counter: just one atomic_fetch_add, no mutex (represents the
+ *      theoretical lock-free upper bound)
+ *   3. uncontended mutex: a single thread repeatedly lock->op->unlock
+ *      (measures the mutex cost itself)
+ *   4. libchan try_send/try_recv pair (real channel, single-threaded path
+ *      with no waiting)
+ *   5. libchan blocking send/recv (two threads, exercises real park/unpark,
+ *      represents the full path)
  *
- * 所有计时均排除 warmup，用 CLOCK_MONOTONIC 纳秒精度。
+ * All timing excludes warmup and uses CLOCK_MONOTONIC nanosecond precision.
  */
 
 #define _GNU_SOURCE
@@ -23,7 +28,7 @@
 
 #include "libchan.h"
 
-/* ---- 计时工具 ---- */
+/* ---- timing utilities ---- */
 
 static inline int64_t now_ns(void) {
     struct timespec ts;
@@ -42,7 +47,7 @@ static inline double mops_per_sec(int64_t elapsed_ns, long ops) {
 #define ITERS      5000000L
 #define WARMUP     200000L
 
-/* ---- 1. 基线：裸 memcpy ---- */
+/* ---- 1. baseline: raw memcpy ---- */
 static void bench_memcpy(void) {
     int src = 42, dst = 0;
     /* warmup */
@@ -51,16 +56,16 @@ static void bench_memcpy(void) {
     int64_t t0 = now_ns();
     for (long i = 0; i < ITERS; i++) {
         memcpy(&dst, &src, sizeof(int));
-        __asm__ volatile("" ::: "memory"); /* 阻止编译器完全消除循环 */
+        __asm__ volatile("" ::: "memory"); /* prevent the compiler from eliminating the loop */
     }
     int64_t elapsed = now_ns() - t0;
     printf("%-40s  %8.2f ns/op  %8.2f Mops/s\n",
-           "1. 裸 memcpy（基线）",
+           "1. raw memcpy (baseline)",
            ns_per_op(elapsed, ITERS), mops_per_sec(elapsed, ITERS));
     (void)dst;
 }
 
-/* ---- 2. 原子计数（lock-free 理论上界） ---- */
+/* ---- 2. atomic counter (theoretical lock-free upper bound) ---- */
 static void bench_atomic(void) {
     _Atomic long counter = 0;
     for (long i = 0; i < WARMUP; i++)
@@ -71,11 +76,11 @@ static void bench_atomic(void) {
         atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
     int64_t elapsed = now_ns() - t0;
     printf("%-40s  %8.2f ns/op  %8.2f Mops/s\n",
-           "2. atomic_fetch_add relaxed（lock-free 上界）",
+           "2. atomic_fetch_add relaxed (lock-free upper bound)",
            ns_per_op(elapsed, ITERS), mops_per_sec(elapsed, ITERS));
 }
 
-/* ---- 3. 无竞争 mutex：lock→nop→unlock ---- */
+/* ---- 3. uncontended mutex: lock->nop->unlock ---- */
 static void bench_mutex_uncontended(void) {
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     int x = 0;
@@ -93,13 +98,13 @@ static void bench_mutex_uncontended(void) {
     }
     int64_t elapsed = now_ns() - t0;
     printf("%-40s  %8.2f ns/op  %8.2f Mops/s\n",
-           "3. mutex lock+nop+unlock（无竞争）",
+           "3. mutex lock+nop+unlock (uncontended)",
            ns_per_op(elapsed, ITERS), mops_per_sec(elapsed, ITERS));
     pthread_mutex_destroy(&mu);
     (void)x;
 }
 
-/* ---- 4. 竞争 mutex：2 线程交替持锁 ---- */
+/* ---- 4. contended mutex: 2 threads alternate holding the lock ---- */
 typedef struct { pthread_mutex_t *mu; long iters; _Atomic long ready; } contend_arg_t;
 
 static void *contend_worker(void *arg) {
@@ -108,7 +113,7 @@ static void *contend_worker(void *arg) {
     while (atomic_load(&a->ready) < 2) sched_yield();
     for (long i = 0; i < a->iters; i++) {
         pthread_mutex_lock(a->mu);
-        /* 临界区：模拟极短操作 */
+        /* critical section: simulate an extremely short operation */
         __asm__ volatile("" ::: "memory");
         pthread_mutex_unlock(a->mu);
     }
@@ -137,16 +142,16 @@ static void bench_mutex_contended(void) {
     pthread_mutex_destroy(&mu);
 
     printf("%-40s  %8.2f ns/op  %8.2f Mops/s\n",
-           "4. mutex lock+nop+unlock（2线程竞争）",
+           "4. mutex lock+nop+unlock (2 threads contended)",
            ns_per_op(elapsed, ITERS / 2), mops_per_sec(elapsed, ITERS / 2));
 }
 
-/* ---- 5. libchan try_send+try_recv（单线程，无等待） ---- */
+/* ---- 5. libchan try_send+try_recv (single thread, no waiting) ---- */
 static void bench_chan_try_spsc(void) {
     chan_t *ch = chan_create(sizeof(int), 1024);
     int v = 1, out;
 
-    /* 预热 */
+    /* warmup */
     for (long i = 0; i < WARMUP; i++) {
         chan_try_send(ch, &v);
         chan_try_recv(ch, &out);
@@ -159,13 +164,13 @@ static void bench_chan_try_spsc(void) {
     }
     int64_t elapsed = now_ns() - t0;
     printf("%-40s  %8.2f ns/op  %8.2f Mops/s\n",
-           "5. chan try_send+try_recv cap=1024（单线程）",
+           "5. chan try_send+try_recv cap=1024 (single thread)",
            ns_per_op(elapsed, ITERS), mops_per_sec(elapsed, ITERS));
     chan_destroy(ch);
     (void)out;
 }
 
-/* ---- 6. libchan 阻塞 send/recv（双线程，完整路径） ---- */
+/* ---- 6. libchan blocking send/recv (two threads, full path) ---- */
 typedef struct { chan_t *ch; long iters; } pair_arg_t;
 
 static void *recv_worker(void *arg) {
@@ -202,20 +207,20 @@ static void bench_chan_blocking(size_t cap, int nthreads, const char *label) {
            mops_per_sec(elapsed, per_thread * nthreads));
 }
 
-/* ---- 7. 推算：mutex 在 chan 总延迟中的占比 ---- */
+/* ---- 7. estimate: mutex share of the total chan latency ---- */
 static void print_analysis(void) {
-    puts("\n---- 锁开销分析 ----");
-    puts("每次 send+recv 涉及 2 次 lock/unlock（send 持锁 + recv 持锁）。");
-    puts("无竞争 mutex 约 10–20 ns/次，2 次 ≈ 20–40 ns。");
-    puts("chan try_send+try_recv（单线程）完整路径见上方数据。");
-    puts("lock 占比 ≈ (2 × mutex_uncontended_ns) / chan_try_ns × 100%。");
-    puts("真实阻塞路径还额外包含：waiter 入队、park_wait、唤醒、memcpy 等。");
+    puts("\n---- lock overhead analysis ----");
+    puts("Each send+recv involves 2 lock/unlock pairs (send holds the lock + recv holds the lock).");
+    puts("An uncontended mutex is about 10-20 ns each, 2 of them ~= 20-40 ns.");
+    puts("See the data above for the full chan try_send+try_recv (single thread) path.");
+    puts("lock share ~= (2 x mutex_uncontended_ns) / chan_try_ns x 100%.");
+    puts("The real blocking path additionally includes: waiter enqueue, park_wait, wakeup, memcpy, etc.");
 }
 
 int main(void) {
-    printf("CPU: 13th Gen Intel Core i7-13700H（WSL2，LIBCHAN_SPIN_LIMIT=40）\n");
-    printf("单次操作定义：send 1 个 int + recv 1 个 int（一个完整数据交换）\n");
-    printf("%-40s  %10s  %12s\n", "场景", "ns/op", "Mops/s");
+    printf("CPU: 13th Gen Intel Core i7-13700H (WSL2, LIBCHAN_SPIN_LIMIT=40)\n");
+    printf("single op definition: send 1 int + recv 1 int (one full data exchange)\n");
+    printf("%-40s  %10s  %12s\n", "scenario", "ns/op", "Mops/s");
     printf("%-40s  %10s  %12s\n",
            "----------------------------------------",
            "----------", "------------");
@@ -225,10 +230,10 @@ int main(void) {
     bench_mutex_uncontended();
     bench_mutex_contended();
     bench_chan_try_spsc();
-    bench_chan_blocking(1024, 1, "6a. chan send+recv cap=1024（1+1线程）");
-    bench_chan_blocking(0,    1, "6b. chan send+recv 无缓冲（1+1线程）");
-    bench_chan_blocking(1024, 2, "6c. chan send+recv cap=1024（2+2线程）");
-    bench_chan_blocking(1024, 4, "6d. chan send+recv cap=1024（4+4线程）");
+    bench_chan_blocking(1024, 1, "6a. chan send+recv cap=1024 (1+1 threads)");
+    bench_chan_blocking(0,    1, "6b. chan send+recv unbuffered (1+1 threads)");
+    bench_chan_blocking(1024, 2, "6c. chan send+recv cap=1024 (2+2 threads)");
+    bench_chan_blocking(1024, 4, "6d. chan send+recv cap=1024 (4+4 threads)");
 
     print_analysis();
     return 0;

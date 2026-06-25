@@ -1,26 +1,33 @@
 /*
  * bench/crosslang/libchan/bench.c
  *
- * 跨语言对比基准 — libchan (C) 端
+ * Cross-language comparison benchmark — libchan (C) side
  *
- * 方法论：固定消息数（非固定时长），测完成全部收发的墙钟时间。
- *   - 每个生产者发送固定 K 条；消费者一直收到通道关闭为止 → 收发条数精确相等。
- *   - 计时：从生产者开始发送，到所有消费者收完（通道 drain 完毕）。
- *   - 吞吐 = 总消息数 / 墙钟秒 / 1e6 (Mops/s)。
+ * Methodology: fixed message count (not fixed duration); measure the wall-clock
+ * time to complete all sends and receives.
+ *   - Each producer sends a fixed K messages; each consumer keeps receiving until
+ *     the channel closes -> sent and received counts are exactly equal.
+ *   - Timing: from when producers start sending until all consumers have finished
+ *     (the channel is fully drained).
+ *   - Throughput = total messages / wall-clock seconds / 1e6 (Mops/s).
  *
- * 时长校准：先用一个小消息数定时跑一遍，估算吞吐，再据此把正式测量的消息数
- *   标定到目标时长（~1.5s，不会太短），避免不同场景时长悬殊。
+ * Duration calibration: first run once for a fixed time with a small message count
+ *   to estimate throughput, then use that estimate to calibrate the real measurement's
+ *   message count to the target duration (~1.5s, not too short), avoiding wildly
+ *   different durations across scenarios.
  *
- * 三种变体（各输出一行 CSV）：
- *   direct — 生产者 chan_send / 消费者 chan_recv（核心路径，精确无丢失）
- *   spsc   — 同 direct，但通道由 chan_create_spsc 创建（单生产单消费快路径，
- *            游标缓存 + 无 per-op fence）。仅对 1P1C 场景有意义并输出。
- *   select — 生产者/消费者各跑一次 2-case chan_select（含一个永不就绪的 dummy
- *            第二路），对标 Go select / Rust select!。
- *            注：select 在 MPMC（≥2P+2C）下有已知的微小计数偏差（约 0.01%，
- *            见 doc/design.md 的 Select 已知限制），不影响吞吐量级。
+ * Three variants (each emits one CSV row):
+ *   direct — producer chan_send / consumer chan_recv (core path, exact, no loss)
+ *   spsc   — same as direct, but the channel is created via chan_create_spsc
+ *            (single-producer single-consumer fast path: cursor caching + no per-op
+ *            fence). Only meaningful for, and emitted for, the 1P1C scenarios.
+ *   select — producer/consumer each run one 2-case chan_select (with a dummy second
+ *            case that is never ready), matching Go select / Rust select!.
+ *            Note: select has a known tiny counting deviation under MPMC (>=2P+2C)
+ *            (about 0.01%, see the Select known-limitations section in doc/design.md);
+ *            it does not affect the throughput order of magnitude.
  *
- * 输出（CSV）：lang,np,nc,cap,mops    lang ∈ {libchan_direct, libchan_spsc, libchan_select}
+ * Output (CSV): lang,np,nc,cap,mops    lang in {libchan_direct, libchan_spsc, libchan_select}
  */
 
 #define _GNU_SOURCE
@@ -34,8 +41,8 @@
 
 #include "libchan.h"
 
-#define TARGET_SEC   1.5      /* 正式测量目标时长 */
-#define CALIB_MSGS   200000L  /* 校准用的小消息数 */
+#define TARGET_SEC   1.5      /* target duration for the real measurement */
+#define CALIB_MSGS   200000L  /* small message count used for calibration */
 #define MIN_MSGS     200000L
 #define MAX_MSGS     80000000L
 
@@ -45,12 +52,12 @@ static inline int64_t now_ns(void) {
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static chan_t *g_dummy;   /* 无缓冲、无人发送、运行期不关闭 → select 第二路永不就绪 */
+static chan_t *g_dummy;   /* unbuffered, no sender, never closed during the run -> select's second case is never ready */
 
 typedef struct { chan_t *ch; long k; }              prod_arg_t;
 typedef struct { chan_t *ch; _Atomic long *recvd; } cons_arg_t;
 
-/* ── direct 变体 ──────────────────────────────────────────────────────────── */
+/* ── direct variant ──────────────────────────────────────────────────────── */
 static void *producer_direct(void *arg) {
     prod_arg_t *a = arg;
     int v = 0;
@@ -66,7 +73,7 @@ static void *consumer_direct(void *arg) {
     return NULL;
 }
 
-/* ── select 变体 ──────────────────────────────────────────────────────────── */
+/* ── select variant ──────────────────────────────────────────────────────── */
 static void *producer_select(void *arg) {
     prod_arg_t *a = arg;
     int v = 0, dummy = 0;
@@ -97,7 +104,7 @@ static void *consumer_select(void *arg) {
     return NULL;
 }
 
-/* ── 跑一轮固定消息数，返回墙钟纳秒；可选校验精确计数 ───────────────────────── */
+/* ── Run one round with a fixed message count, return wall-clock nanoseconds; optionally verify the exact count ── */
 static int64_t run_msgs(int np, int nc, int cap, long total,
                         void *(*pf)(void *), void *(*cf)(void *),
                         bool check, bool spsc, long *got_out) {
@@ -130,28 +137,28 @@ static int64_t run_msgs(int np, int nc, int cap, long total,
     long got = atomic_load_explicit(&recvd, memory_order_relaxed);
     if (got_out) *got_out = got;
     if (check && got != total) {
-        /* direct 必须精确；select MPMC 有已知微小偏差，仅警告。 */
-        fprintf(stderr, "  [warn] np=%d nc=%d cap=%d: 预期 %ld 收到 %ld (差 %+ld)\n",
+        /* direct must be exact; select MPMC has a known tiny deviation, so only warn. */
+        fprintf(stderr, "  [warn] np=%d nc=%d cap=%d: expected %ld received %ld (diff %+ld)\n",
                 np, nc, cap, total, got, got - total);
     }
     chan_destroy(ch);
     return dt;
 }
 
-/* ── 校准 + 正式测量，返回 Mops/s ──────────────────────────────────────────── */
+/* ── Calibrate + real measurement, return Mops/s ──────────────────────────── */
 static double measure(int np, int nc, int cap,
                       void *(*pf)(void *), void *(*cf)(void *), bool check, bool spsc) {
-    /* 1) 校准：小消息数估吞吐 */
+    /* 1) Calibration: estimate throughput with a small message count */
     int64_t cdt = run_msgs(np, nc, cap, CALIB_MSGS, pf, cf, false, spsc, NULL);
     double calib_total = (double)((CALIB_MSGS / np) * np);
     double rate = calib_total / ((double)cdt / 1e9);     /* msgs/sec */
 
-    /* 2) 标定正式消息数到目标时长 */
+    /* 2) Calibrate the real message count to the target duration */
     long msgs = (long)(rate * TARGET_SEC);
     if (msgs < MIN_MSGS) msgs = MIN_MSGS;
     if (msgs > MAX_MSGS) msgs = MAX_MSGS;
 
-    /* 3) 正式测量 */
+    /* 3) Real measurement */
     long got = 0;
     int64_t dt = run_msgs(np, nc, cap, msgs, pf, cf, check, spsc, &got);
     long total = (msgs / np) * np;
@@ -172,9 +179,10 @@ int main(void) {
         printf("libchan_direct,%d,%d,%d,%.3f\n", np, nc, cap, d);
         fflush(stdout);
     }
-    /* SPSC 快路径：仅对单生产单消费的【有缓冲】通道有意义（契约：1P+1C；cap==0 时
-     * chan_create_spsc 等同 chan_create，无快路径，故跳过以免误导）。复用 direct 的
-     * 收发函数（chan_send/chan_recv 内部按 ch->spsc 分派）。 */
+    /* SPSC fast path: only meaningful for single-producer single-consumer [buffered]
+     * channels (contract: 1P+1C; when cap==0, chan_create_spsc is equivalent to
+     * chan_create with no fast path, so skip it to avoid misleading results). Reuses
+     * direct's send/recv functions (chan_send/chan_recv dispatch internally on ch->spsc). */
     for (int i = 0; i < nsc; i++) {
         int np = sc[i][0], nc = sc[i][1], cap = sc[i][2];
         if (np != 1 || nc != 1 || cap == 0) continue;

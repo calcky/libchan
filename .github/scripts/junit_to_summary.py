@@ -18,7 +18,7 @@ def main() -> int:
     try:
         root = ET.parse(path).getroot()
     except Exception as exc:  # missing file, bad XML, etc.
-        print(f"### ❌ {title}\n\n> 无法读取 JUnit 报告 `{path}`：{exc}\n")
+        print(f"### ❌ {title}\n\n> Could not read JUnit report `{path}`: {exc}\n")
         return 0
 
     # CTest may emit <testsuites><testsuite>... or a top-level <testsuite>.
@@ -40,12 +40,12 @@ def main() -> int:
 
     out = [f"### {icon} {title}", ""]
     if total == 0:
-        out.append("> 未发现任何用例（检查 `LIBCHAN_BUILD_TESTS=ON` 与 `--no-tests=error`）。")
+        out.append("> No test cases found (check `LIBCHAN_BUILD_TESTS=ON` and `--no-tests=error`).")
         print("\n".join(out) + "\n")
         return 0
 
-    out.append(f"**{n_pass}/{total} 通过**，{n_fail} 失败。")
-    out += ["", "| 用例 | 结果 | 耗时 (s) |", "|------|------|---------:|"]
+    out.append(f"**{n_pass}/{total} passed**, {n_fail} failed.")
+    out += ["", "| Test case | Result | Time (s) |", "|------|------|---------:|"]
     for tc in cases:
         name = tc.get("name", "?")
         t = tc.get("time", "")
@@ -64,7 +64,7 @@ def main() -> int:
             if text:
                 details.append(f"#### `{tc.get('name', '?')}`\n```\n{text[:2000]}\n```")
     if details:
-        out += ["", "<details><summary>失败详情</summary>", ""] + details + ["", "</details>"]
+        out += ["", "<details><summary>Failure details</summary>", ""] + details + ["", "</details>"]
 
     print("\n".join(out) + "\n")
     return 0

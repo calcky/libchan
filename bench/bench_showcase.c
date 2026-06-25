@@ -1,26 +1,32 @@
 /*
- * bench_showcase.c — libchan 性能展示基准（性能阶梯 + A/B 分档）
+ * bench_showcase.c — libchan performance showcase benchmark (performance ladder + A/B tiers)
  *
- * 目的:对外展示 libchan 性能。核心叙事是一条"性能阶梯",让读者一眼看出
- * libchan 的无锁快路径贴近硬件极限,且慢的地方(park)是 OS 的开销、不是库的。
+ * Purpose: showcase libchan performance externally. The core narrative is a
+ * "performance ladder" that lets readers see at a glance that libchan's
+ * lock-free fast path is close to the hardware floor, and that the slow parts
+ * (park) are OS overhead, not the library's.
  *
- *   A 档 · 几乎不 park（测 "channel 自己有多快"）:
- *     1. 裸 memcpy            —— 硬件极限
- *     2. atomic_fetch_add     —— 无锁原语下界
- *     3. 无锁 ring 纯队列      —— 队列数据结构本身(不经 chan)
- *     4. chan try_send/recv   —— + channel 语义(无等待)
- *     5. chan SPSC 跨核稳态  —— 真并发、busy-poll 不 park 的无锁快路径(跨核传递)
+ *   Tier A · almost no park (measures "how fast the channel itself is"):
+ *     1. bare memcpy          —— hardware floor
+ *     2. atomic_fetch_add     —— lock-free primitive lower bound
+ *     3. lock-free ring pure queue —— the queue data structure itself (no chan)
+ *     4. chan try_send/recv   —— + channel semantics (no wait)
+ *     5. chan SPSC cross-core steady-state —— true concurrency, lock-free fast
+ *        path with busy-poll and no park (cross-core handoff)
  *
- *   B 档 · 必然 park（测 "channel 作为同步原语"的端到端延迟,含 OS 调度）:
- *     6. chan SPSC 阻塞 cap=1024
- *     7. chan 无缓冲 rendezvous
+ *   Tier B · always park (measures the end-to-end latency of "the channel as a
+ *   synchronization primitive", including OS scheduling):
+ *     6. chan SPSC blocking cap=1024
+ *     7. chan unbuffered rendezvous
  *     8. chan MPMC 4P+4C cap=1024
  *
- * 测量:每个数据点跑 BENCH_REPEAT 次,报【中位数】与【min】(min ≈ 无干扰下界)。
- * 计时用 CLOCK_MONOTONIC,均排除 warmup。
+ * Measurement: each data point runs BENCH_REPEAT times, reporting the [median]
+ * and [min] (min ≈ interference-free lower bound). Timed with CLOCK_MONOTONIC,
+ * warmup always excluded.
  *
- * 注意:B 档数字受 OS 调度影响大,仅量级参考;严肃测量需原生 Linux + 钉核
- * (见 bench/run_showcase.sh)。WSL2 上抖动明显。
+ * Note: Tier B numbers are heavily affected by OS scheduling and are a
+ * trend-only reference; serious measurement needs native Linux + core pinning
+ * (see bench/run_showcase.sh). Jitter is significant on WSL2.
  */
 
 #include <stdio.h>
@@ -33,18 +39,19 @@
 #include <sched.h>
 
 #include "libchan.h"
-#include "ring_lf.h"   /* 纯队列层,来自 src/(CMake 已把 src 加入 include) */
+#include "ring_lf.h"   /* pure queue layer, from src/ (CMake already adds src to include) */
 
-/* ── 计时工具 ─────────────────────────────────────────────── */
+/* ── timing utilities ─────────────────────────────────────────────── */
 static inline int64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-/* ── median-of-K 测量骨架 ─────────────────────────────────────
- * bench_fn 跑一整轮、返回该轮的 ns/op。run_point 跑 K 次,排序后报
- * 中位数与 min,并据中位数换算 Mops/s。 */
+/* ── median-of-K measurement skeleton ─────────────────────────────────
+ * bench_fn runs one full round and returns that round's ns/op. run_point runs
+ * K times, sorts, and reports the median and min, converting Mops/s from the
+ * median. */
 #define BENCH_REPEAT 7
 
 typedef double (*bench_fn)(void *ctx);
@@ -64,7 +71,7 @@ static void run_point(const char *label, bench_fn fn, void *ctx) {
     printf("%-38s  %9.2f  %9.2f  %9.2f\n", label, med, mn, mops);
 }
 
-/* ── A 档 ───────────────────────────────────────────────────── */
+/* ── Tier A ───────────────────────────────────────────────────── */
 
 #define A_ITERS 5000000L
 #define A_WARMUP 200000L
@@ -93,7 +100,8 @@ static double bench_atomic(void *ctx) {
     return (double)dt / A_ITERS;
 }
 
-/* 无锁 ring 纯队列:单线程 push 一个 / pop 一个,完全不经 chan、不 park。 */
+/* lock-free ring pure queue: single-thread push one / pop one, entirely
+ * bypassing chan and never parking. */
 static double bench_ring_pure(void *ctx) {
     (void)ctx;
     chan_ring_lf_t r;
@@ -108,7 +116,8 @@ static double bench_ring_pure(void *ctx) {
     return (double)dt / A_ITERS;
 }
 
-/* chan try_send + try_recv:加上 channel 语义(closed 检查、waiter 计数门槛等),但无等待。 */
+/* chan try_send + try_recv: adds channel semantics (closed check, waiter-count
+ * gate, etc.), but no waiting. */
 static double bench_chan_try(void *ctx) {
     (void)ctx;
     chan_t *ch = chan_create(sizeof(int), 1024);
@@ -122,10 +131,13 @@ static double bench_chan_try(void *ctx) {
     return (double)dt / A_ITERS;
 }
 
-/* chan SPSC 稳态(A 档主角):两个线程都用 try_ + 自旋,从不调用阻塞 send/recv,
- * 因此 waiter 计数恒为 0、收发始终命中无锁快路径、谁都不 park。测真并发下纯快路径吞吐。
- * (用阻塞 recv 会在环偶发为空时 park → recv_waiter_cnt>0 → 把生产者也踢下快路径,
- *  那样测的就是 park 路径了,见 B 档。) */
+/* chan SPSC steady-state (Tier A's star): both threads use try_ + spin, never
+ * calling blocking send/recv, so the waiter count stays 0, send/recv always hit
+ * the lock-free fast path, and nobody parks. Measures pure fast-path throughput
+ * under true concurrency.
+ * (Using a blocking recv would park when the ring is occasionally empty →
+ *  recv_waiter_cnt>0 → kicking the producer off the fast path too, which would
+ *  then measure the park path, see Tier B.) */
 #define SS_CAP    4096
 #define SS_MSGS   8000000L
 
@@ -135,21 +147,21 @@ static void *ss_consumer(void *arg) {
     ss_ctx_t *s = arg;
     int out;
     for (;;) {
-        if (chan_try_recv(s->ch, &out) == CHAN_OK) continue;     /* 拿到就继续 */
+        if (chan_try_recv(s->ch, &out) == CHAN_OK) continue;     /* got one, keep going */
         if (atomic_load_explicit(&s->done, memory_order_acquire)) {
-            /* 生产者已结束:再 drain 干净后退出 */
+            /* producer finished: drain clean, then exit */
             if (chan_try_recv(s->ch, &out) == CHAN_OK) continue;
             break;
         }
-        __asm__ volatile("" ::: "memory");                       /* 空转 */
+        __asm__ volatile("" ::: "memory");                       /* spin */
     }
     return NULL;
 }
 
 static double bench_chan_steady(void *ctx) {
     bool spsc = *(const bool *)ctx;
-    chan_t *ch = spsc ? chan_create_spsc(sizeof(int), SS_CAP)   /* 游标缓存快路径 */
-                      : chan_create(sizeof(int), SS_CAP);        /* MPMC：每条弹跳游标 */
+    chan_t *ch = spsc ? chan_create_spsc(sizeof(int), SS_CAP)   /* cursor-caching fast path */
+                      : chan_create(sizeof(int), SS_CAP);        /* MPMC: cursor bounces per message */
     ss_ctx_t s = { ch, 0 };
     pthread_t c;
     pthread_create(&c, NULL, ss_consumer, &s);
@@ -157,7 +169,7 @@ static double bench_chan_steady(void *ctx) {
     int v = 0;
     int64_t t0 = now_ns();
     for (long i = 0; i < SS_MSGS; i++) {
-        while (chan_try_send(ch, &v) != CHAN_OK)                 /* 满则自旋,不 park */
+        while (chan_try_send(ch, &v) != CHAN_OK)                 /* spin if full, no park */
             __asm__ volatile("" ::: "memory");
         v++;
     }
@@ -169,7 +181,7 @@ static double bench_chan_steady(void *ctx) {
     return (double)dt / SS_MSGS;
 }
 
-/* ── B 档:阻塞路径(含 park + OS 调度)──────────────────────── */
+/* ── Tier B: blocking path (includes park + OS scheduling) ──────────────── */
 
 #define B_MSGS 2000000L
 
@@ -188,8 +200,8 @@ static void *b_producer(void *arg) {
     return NULL;
 }
 
-/* 通用阻塞测量:np 个生产者各发 k 条,nc 个消费者 drain 到 close。
- * 返回每条消息的平均 ns。cfg 通过 ctx 传入。 */
+/* generic blocking measurement: np producers each send k messages, nc consumers
+ * drain until close. Returns the average ns per message. cfg passed via ctx. */
 typedef struct { int cap, np, nc; long total; bool spsc; } bcfg_t;
 
 static double bench_blocking(void *ctx) {
@@ -218,33 +230,33 @@ static double bench_blocking(void *ctx) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    printf("libchan 性能展示基准  (每点取 %d 次的 中位数/min)\n", BENCH_REPEAT);
-    printf("单次操作 = 一次 send + 一次 recv 的等价工作\n\n");
+    printf("libchan performance showcase benchmark  (median/min over %d runs per point)\n", BENCH_REPEAT);
+    printf("single operation = the equivalent work of one send + one recv\n\n");
 
-    printf("=== A 档 · 性能阶梯（几乎不 park，测 channel 本身）===\n");
-    printf("%-38s  %9s  %9s  %9s\n", "场景", "中位 ns", "min ns", "Mops/s");
+    printf("=== Tier A · performance ladder (almost no park, measures the channel itself) ===\n");
+    printf("%-38s  %9s  %9s  %9s\n", "scenario", "med ns", "min ns", "Mops/s");
     printf("%-38s  %9s  %9s  %9s\n", "------------------------------------",
            "--------", "--------", "--------");
-    run_point("1. 裸 memcpy（硬件极限）",        bench_memcpy,           NULL);
-    run_point("2. atomic_fetch_add（无锁下界）", bench_atomic,           NULL);
-    run_point("3. 无锁 ring 纯队列",           bench_ring_pure,        NULL);
-    run_point("4. chan try_send/recv（无等待）", bench_chan_try,         NULL);
+    run_point("1. bare memcpy (hardware floor)",        bench_memcpy,           NULL);
+    run_point("2. atomic_fetch_add (lock-free bound)", bench_atomic,           NULL);
+    run_point("3. lock-free ring pure queue",           bench_ring_pure,        NULL);
+    run_point("4. chan try_send/recv (no wait)", bench_chan_try,         NULL);
     bool steady_mpmc = false, steady_spsc = true;
-    run_point("5. chan MPMC 跨核稳态（缓存一致性墙）", bench_chan_steady, &steady_mpmc);
-    run_point("6. chan SPSC 跨核稳态（游标缓存破墙）", bench_chan_steady, &steady_spsc);
+    run_point("5. chan MPMC cross-core steady-state (cache-coherence wall)", bench_chan_steady, &steady_mpmc);
+    run_point("6. chan SPSC cross-core steady-state (cursor caching breaks the wall)", bench_chan_steady, &steady_spsc);
 
-    printf("\n=== B 档 · 阻塞延迟（含 park + OS 调度，仅量级参考）===\n");
-    printf("%-38s  %9s  %9s  %9s\n", "场景", "中位 ns", "min ns", "Mops/s");
+    printf("\n=== Tier B · blocking latency (includes park + OS scheduling, trend-only reference) ===\n");
+    printf("%-38s  %9s  %9s  %9s\n", "scenario", "med ns", "min ns", "Mops/s");
     printf("%-38s  %9s  %9s  %9s\n", "------------------------------------",
            "--------", "--------", "--------");
-    bcfg_t b6 = { 1024, 1, 1, B_MSGS, true  };   /* 真 SPSC 阻塞 */
+    bcfg_t b6 = { 1024, 1, 1, B_MSGS, true  };   /* true SPSC blocking */
     bcfg_t b7 = { 0,    1, 1, B_MSGS, false };
     bcfg_t b8 = { 1024, 4, 4, B_MSGS, false };
-    run_point("7. chan SPSC 阻塞 cap=1024",       bench_blocking, &b6);
-    run_point("8. chan 无缓冲 rendezvous",        bench_blocking, &b7);
+    run_point("7. chan SPSC blocking cap=1024",       bench_blocking, &b6);
+    run_point("8. chan unbuffered rendezvous",        bench_blocking, &b7);
     run_point("9. chan MPMC 4P+4C cap=1024",      bench_blocking, &b8);
 
-    printf("\n说明: A 档收发命中无锁快路径、谁都不睡,反映 channel 本身的开销;\n");
-    printf("      B 档每次操作可能 park,测的是含 OS 调度的端到端同步延迟。\n");
+    printf("\nNote: Tier A send/recv hit the lock-free fast path and nobody sleeps, reflecting the channel's own overhead;\n");
+    printf("      in Tier B each operation may park, measuring end-to-end synchronization latency including OS scheduling.\n");
     return 0;
 }

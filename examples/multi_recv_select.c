@@ -1,20 +1,22 @@
 /*
  * multi_recv_select.c
  *
- * 多路接收方案一：chan_select
+ * Multi-way receive, approach 1: chan_select
  *
- * 适用场景：n ≤ 4 路、不想引入额外线程、语义对应 Go select。
+ * Use when: n ≤ 4 channels, you don't want to spawn extra threads, and you
+ * want semantics matching Go's select.
  *
- * 原理：
- *   chan_select 在持所有 channel 锁的同时扫描就绪状态，有就绪时立即执行；
- *   无就绪时在所有 channel 上各注册一个 stub waiter，共享一个 park，
- *   只睡一次，第一个就绪的 channel 唤醒主线程。
+ * Principle:
+ *   chan_select scans for ready state while holding all channel locks; if any
+ *   is ready it executes immediately. If none is ready, it registers a stub
+ *   waiter on every channel, sharing a single park, and sleeps once; the first
+ *   channel to become ready wakes the main thread.
  *
- * 开销：
- *   快路径（有 channel 就绪）：O(n) 次 mutex_lock，约 30–80 ns（n=2–4）。
- *   慢路径（需等待）：注册 n 个 stub + park 一次 + 清理 O(n) 锁。
+ * Cost:
+ *   Fast path (a channel is ready): O(n) mutex_locks, ~30–80 ns (n=2–4).
+ *   Slow path (must wait): register n stubs + one park + O(n)-lock cleanup.
  *
- * 编译：
+ * Build:
  *   gcc -O2 -o multi_recv_select multi_recv_select.c -lchan -lpthread
  */
 
@@ -53,8 +55,9 @@ int main(void) {
     }
 
     /*
-     * 每轮把仍活跃的 channel 打包成紧凑 cases 数组传给 chan_select。
-     * 用 slot_id[] 记录 compact[j] 对应的原始下标，方便关闭时标记。
+     * Each round, pack the still-active channels into a compact cases array
+     * and pass it to chan_select. Use slot_id[] to record the original index
+     * that compact[j] corresponds to, so closures are easy to mark.
      */
     bool active[N_SENDERS];
     int  vals[N_SENDERS];
@@ -64,15 +67,15 @@ int main(void) {
     int total    = 0;
 
     while (n_active > 0) {
-        /* 构建紧凑 cases 数组 */
+        /* Build the compact cases array */
         chan_select_case_t cases[N_SENDERS];
-        int slot_id[N_SENDERS];   /* cases[j] 对应原始下标 slot_id[j] */
+        int slot_id[N_SENDERS];   /* cases[j] maps to original index slot_id[j] */
         int nc = 0;
         for (int i = 0; i < N_SENDERS; i++) {
             if (!active[i]) continue;
             cases[nc].ch   = chs[i];
             cases[nc].op   = CHAN_OP_RECV;
-            cases[nc].data = &vals[i];   /* 始终写入固定槽位，无指针错位 */
+            cases[nc].data = &vals[i];   /* always write to a fixed slot, no pointer aliasing */
             slot_id[nc]    = i;
             nc++;
         }

@@ -1,13 +1,15 @@
 /*
- * ping_pong.c — Ping-pong 延迟基准
+ * ping_pong.c — Ping-pong latency benchmark
  *
- * 两个线程用一对无缓冲通道来回弹一个 token,实测 rendezvous 往返延迟。
+ * Two threads bounce a token back and forth over a pair of unbuffered channels,
+ * measuring the rendezvous round-trip latency.
  *
  *   main:   send(ping) ──► ponger: recv(ping)
- *   main:   recv(pong) ◄── ponger: send(pong)      ← 一个往返 = 2 次 rendezvous
+ *   main:   recv(pong) ◄── ponger: send(pong)      ← one round-trip = 2 rendezvous
  *
- * 无缓冲(cap=0)强制每次收发都同步握手,直接命中 architecture 文档里说的
- * park/wake 路径。每次往返含 2 次 channel rendezvous,各自一次 park/unpark。
+ * Unbuffered (cap=0) forces every send/recv to synchronously hand off, hitting
+ * the park/wake path described in the architecture docs. Each round-trip
+ * involves 2 channel rendezvous, each with one park/unpark.
  */
 #include <stdio.h>
 #include <pthread.h>
@@ -25,7 +27,7 @@ static int64_t now_ns(void) {
 
 typedef struct { chan_t *ping, *pong; } arg_t;
 
-/* ponger: 收 ping,原样回 pong。 */
+/* ponger: recv ping, echo it back as pong. */
 static void *ponger(void *arg) {
     arg_t *a = arg;
     int v;
@@ -37,20 +39,20 @@ static void *ponger(void *arg) {
 }
 
 int main(void) {
-    chan_t *ping = chan_create(sizeof(int), 0);   /* 无缓冲 → 强制 rendezvous */
+    chan_t *ping = chan_create(sizeof(int), 0);   /* unbuffered → force rendezvous */
     chan_t *pong = chan_create(sizeof(int), 0);
 
     pthread_t pt;
     arg_t a = { ping, pong };
     pthread_create(&pt, NULL, ponger, &a);
 
-    printf("Ping-pong 延迟基准 — 无缓冲通道来回弹 %d 次...\n", ROUNDS);
+    printf("Ping-pong latency benchmark — bouncing over unbuffered channels %d times...\n", ROUNDS);
 
     int64_t t0 = now_ns();
     int v = 0, r;
     for (int i = 0; i < ROUNDS; i++) {
-        chan_send(ping, &v);     /* 我 → 对方 */
-        chan_recv(pong, &r);     /* 对方 → 我  = 一个往返 */
+        chan_send(ping, &v);     /* me → peer */
+        chan_recv(pong, &r);     /* peer → me  = one round-trip */
         v++;
     }
     int64_t dt = now_ns() - t0;
@@ -58,9 +60,9 @@ int main(void) {
     pthread_join(pt, NULL);
 
     double per = (double)dt / ROUNDS;
-    printf("\n总耗时 %.1f ms,%d 次往返\n", dt / 1e6, ROUNDS);
-    printf("每次往返 %.0f ns  (= 2 次 channel rendezvous)\n", per);
-    printf("每次 channel 操作 \xE2\x89\x88 %.0f ns,\xE2\x89\x88 %.2f Mops/s\n",
+    printf("\nTotal time %.1f ms, %d round-trips\n", dt / 1e6, ROUNDS);
+    printf("Per round-trip %.0f ns  (= 2 channel rendezvous)\n", per);
+    printf("Per channel op \xE2\x89\x88 %.0f ns, \xE2\x89\x88 %.2f Mops/s\n",
            per / 2, 2.0 * ROUNDS / (dt / 1e3));
 
     chan_destroy(ping);

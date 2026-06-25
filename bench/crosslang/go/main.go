@@ -1,17 +1,20 @@
 // bench/crosslang/go/main.go
 //
-// 跨语言对比基准 — Go 端
+// Cross-language comparison benchmark — Go side
 //
-// 方法论：固定消息数（非固定时长），测完成全部收发的墙钟时间。
-//   - 每个生产者发送固定 K 条；消费者收到通道关闭为止 → 收发条数精确相等。
-//   - 时长校准：小消息数定时跑一遍估吞吐，再标定正式测量消息数到 ~1.5s。
+// Methodology: fixed message count (not fixed duration); measure the wall-clock
+// time to complete all sends and receives.
+//   - Each producer sends a fixed K messages; each consumer keeps receiving until
+//     the channel closes -> sent and received counts are exactly equal.
+//   - Duration calibration: run once for a fixed time with a small message count to
+//     estimate throughput, then calibrate the real measurement's message count to ~1.5s.
 //
-// 两种变体：
-//   direct — 生产者 ch<-v / 消费者 range ch（核心路径）
-//   select — 生产者/消费者各跑一次 2-case select（含永不就绪的 dummy 第二路），
-//            对标 C chan_select / Rust select!。
+// Two variants:
+//   direct — producer ch<-v / consumer range ch (core path)
+//   select — producer/consumer each run one 2-case select (with a dummy second case
+//            that is never ready), matching C chan_select / Rust select!.
 //
-// 输出（CSV）：lang,np,nc,cap,mops   lang ∈ {go_direct, go_select}
+// Output (CSV): lang,np,nc,cap,mops   lang in {go_direct, go_select}
 
 package main
 
@@ -31,7 +34,7 @@ const (
 	maxMsgs   = 80000000
 )
 
-var dummy = make(chan int32) // 永不就绪的 select 第二路
+var dummy = make(chan int32) // never-ready second case for select
 
 func makeChan(cap int) chan int32 {
 	if cap == 0 {
@@ -40,7 +43,7 @@ func makeChan(cap int) chan int32 {
 	return make(chan int32, cap)
 }
 
-// ── direct 变体 ──────────────────────────────────────────────
+// ── direct variant ──────────────────────────────────────────
 func runDirect(np, nc, cap int, total int) (int64, time.Duration) {
 	k := total / np
 	total = k * np
@@ -77,13 +80,13 @@ func runDirect(np, nc, cap int, total int) (int64, time.Duration) {
 	wg.Wait()
 	dt := time.Since(t0)
 	if atomic.LoadInt64(&recvd) != int64(total) {
-		fmt.Fprintf(os.Stderr, "  [warn] go_direct np=%d nc=%d cap=%d: 预期 %d 收到 %d\n",
+		fmt.Fprintf(os.Stderr, "  [warn] go_direct np=%d nc=%d cap=%d: expected %d received %d\n",
 			np, nc, cap, total, recvd)
 	}
 	return int64(total), dt
 }
 
-// ── select 变体 ──────────────────────────────────────────────
+// ── select variant ──────────────────────────────────────────
 func runSelect(np, nc, cap int, total int) (int64, time.Duration) {
 	k := total / np
 	total = k * np
@@ -105,7 +108,7 @@ func runSelect(np, nc, cap int, total int) (int64, time.Duration) {
 						return
 					}
 					c++
-				case <-dummy: // 永不就绪
+				case <-dummy: // never ready
 				}
 			}
 		}()
@@ -121,7 +124,7 @@ func runSelect(np, nc, cap int, total int) (int64, time.Duration) {
 				select {
 				case ch <- v:
 					v++
-				case <-dummy: // 永不就绪
+				case <-dummy: // never ready
 				}
 			}
 		}()
@@ -132,18 +135,18 @@ func runSelect(np, nc, cap int, total int) (int64, time.Duration) {
 	_ = done
 	dt := time.Since(t0)
 	if atomic.LoadInt64(&recvd) != int64(total) {
-		fmt.Fprintf(os.Stderr, "  [warn] go_select np=%d nc=%d cap=%d: 预期 %d 收到 %d\n",
+		fmt.Fprintf(os.Stderr, "  [warn] go_select np=%d nc=%d cap=%d: expected %d received %d\n",
 			np, nc, cap, total, recvd)
 	}
 	return int64(total), dt
 }
 
 func measure(np, nc, cap int, run func(int, int, int, int) (int64, time.Duration)) float64 {
-	// 1) 校准
+	// 1) Calibration
 	_, cdt := run(np, nc, cap, calibMsgs)
 	calibTotal := float64((calibMsgs / np) * np)
 	rate := calibTotal / cdt.Seconds()
-	// 2) 标定
+	// 2) Calibrate
 	msgs := int(rate * targetSec)
 	if msgs < minMsgs {
 		msgs = minMsgs
@@ -151,7 +154,7 @@ func measure(np, nc, cap int, run func(int, int, int, int) (int64, time.Duration
 	if msgs > maxMsgs {
 		msgs = maxMsgs
 	}
-	// 3) 正式测量
+	// 3) Real measurement
 	total, dt := run(np, nc, cap, msgs)
 	return float64(total) / dt.Seconds() / 1e6
 }

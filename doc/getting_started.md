@@ -1,47 +1,47 @@
 # Getting Started with libchan
 
-libchan 是一个纯 C11 实现的高性能 channel 库，提供与 Go / Rust 类似的 channel 语义：无缓冲同步握手、有缓冲异步队列、MPMC（多生产者多消费者）、close 通知、以及类 Go `select` 的多路复用。
+libchan is a high-performance channel library implemented in pure C11, providing channel semantics similar to Go / Rust: unbuffered synchronous handshakes, buffered asynchronous queues, MPMC (multiple producers, multiple consumers), close notification, and Go-like `select` multiplexing.
 
 ---
 
-## 构建
+## Building
 
-### 依赖
+### Dependencies
 
 - CMake ≥ 3.16
-- C11 编译器（GCC 或 Clang）
-- pthreads（Linux 默认包含）
+- A C11 compiler (GCC or Clang)
+- pthreads (included by default on Linux)
 
-### 快速构建
+### Quick Build
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --parallel
 ```
 
-或者直接用顶层 `Makefile`：
+Or use the top-level `Makefile` directly:
 
 ```bash
-make          # 构建库
-make test     # 构建并运行所有测试
-make bench    # 构建性能基准（需要 LIBCHAN_BUILD_BENCH=ON）
-make asan     # AddressSanitizer + UBSan 测试
-make tsan     # ThreadSanitizer 测试（需要原生 Linux，WSL2 不支持）
+make          # build the library
+make test     # build and run all tests
+make bench    # build the benchmarks (requires LIBCHAN_BUILD_BENCH=ON)
+make asan     # AddressSanitizer + UBSan tests
+make tsan     # ThreadSanitizer tests (requires native Linux; not supported on WSL2)
 ```
 
-### 构建选项
+### Build Options
 
-| 选项 | 默认 | 说明 |
-|------|------|------|
-| `LIBCHAN_BUILD_SHARED` | `ON` | 构建动态库 `libchan.so` |
-| `LIBCHAN_BUILD_STATIC` | `ON` | 构建静态库 `libchan.a` |
-| `LIBCHAN_BUILD_TESTS` | `ON` | 构建单元测试 |
-| `LIBCHAN_BUILD_BENCH` | `OFF` | 构建吞吐量基准 |
-| `LIBCHAN_FORCE_PTHREAD_PARK` | `OFF` | 强制使用 pthread 后端（禁用 futex，便于在 Linux 上测试可移植路径） |
-| `LIBCHAN_SPIN_LIMIT` | `40` | 进入内核睡眠前的自旋次数，0 = 禁用自旋 |
-| `LIBCHAN_SANITIZE` | 空 | 开启 sanitizer：`address`、`thread`、`undefined`、`address,undefined` |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `LIBCHAN_BUILD_SHARED` | `ON` | Build the shared library `libchan.so` |
+| `LIBCHAN_BUILD_STATIC` | `ON` | Build the static library `libchan.a` |
+| `LIBCHAN_BUILD_TESTS` | `ON` | Build the unit tests |
+| `LIBCHAN_BUILD_BENCH` | `OFF` | Build the throughput benchmarks |
+| `LIBCHAN_FORCE_PTHREAD_PARK` | `OFF` | Force the pthread backend (disables futex, to test the portable path on Linux) |
+| `LIBCHAN_SPIN_LIMIT` | `40` | Number of spins before entering a kernel sleep; 0 = disable spinning |
+| `LIBCHAN_SANITIZE` | empty | Enable a sanitizer: `address`, `thread`, `undefined`, `address,undefined` |
 
-示例：开启 AddressSanitizer：
+Example: enabling AddressSanitizer:
 
 ```bash
 cmake -B build-asan -DLIBCHAN_SANITIZE=address,undefined
@@ -49,16 +49,16 @@ cmake --build build-asan --parallel
 ctest --test-dir build-asan
 ```
 
-### 在你的项目中使用
+### Using It in Your Project
 
-**直接链接静态库**（最简单）：
+**Link the static library directly** (simplest):
 
 ```cmake
 target_link_libraries(my_app PRIVATE /path/to/libchan.a Threads::Threads)
 target_include_directories(my_app PRIVATE /path/to/libchan/include)
 ```
 
-**CMake find_package**（安装后）：
+**CMake find_package** (after installing):
 
 ```bash
 cmake --install build --prefix /usr/local
@@ -71,35 +71,35 @@ target_link_libraries(my_app PRIVATE chan)
 
 ---
 
-## 核心概念
+## Core Concepts
 
-### 无缓冲 vs. 有缓冲
+### Unbuffered vs. Buffered
 
 ```c
-chan_t *unbuf = chan_create(sizeof(int), 0);   /* 无缓冲：capacity == 0 */
-chan_t *buf   = chan_create(sizeof(int), 64);  /* 有缓冲：容量 64 */
+chan_t *unbuf = chan_create(sizeof(int), 0);   /* unbuffered: capacity == 0 */
+chan_t *buf   = chan_create(sizeof(int), 64);  /* buffered: capacity 64 */
 ```
 
-- **无缓冲**：发送方阻塞直到接收方就位（同步握手，rendezvous）。延迟最低，强迫生产消费同步。
-- **有缓冲**：发送方在队列有空间时立即返回，接收方在队列非空时立即返回。解耦生产消费节奏。
+- **Unbuffered**: the sender blocks until a receiver is ready (synchronous handshake, rendezvous). Lowest latency; forces producer/consumer synchronization.
+- **Buffered**: the sender returns immediately when the queue has space, and the receiver returns immediately when the queue is non-empty. Decouples producer and consumer pacing.
 
-### 元素大小
+### Element Size
 
-channel 按**字节拷贝**传递数据，类似 Go 的值传递语义：
+A channel transfers data by **byte copy**, similar to Go's value-passing semantics:
 
 ```c
-/* 传递 int */
+/* pass an int */
 chan_t *ch = chan_create(sizeof(int), 8);
 
-/* 传递指针（自行管理指针所指内存的生命周期） */
+/* pass a pointer (you manage the lifetime of the memory it points to) */
 chan_t *ptr_ch = chan_create(sizeof(void *), 8);
 ```
 
 ---
 
-## 常用模式
+## Common Patterns
 
-### 1. 基础发送/接收
+### 1. Basic Send/Receive
 
 ```c
 #include "libchan.h"
@@ -129,16 +129,16 @@ int main(void) {
 }
 ```
 
-### 2. 非阻塞操作（try_send / try_recv）
+### 2. Non-blocking Operations (try_send / try_recv)
 
-适用于"有就处理，没有就干别的"场景，等价 Go 的 `select { case … default: }`:
+Suited to "handle it if there's something, otherwise do something else" scenarios, equivalent to Go's `select { case … default: }`:
 
 ```c
 int v = 42;
 switch (chan_try_send(ch, &v)) {
-case CHAN_OK:        /* 发送成功 */ break;
-case CHAN_ERR_WOULDBLOCK: /* 队列满，稍后再试 */ break;
-case CHAN_ERR_CLOSED:     /* 通道已关闭 */ break;
+case CHAN_OK:        /* sent successfully */ break;
+case CHAN_ERR_WOULDBLOCK: /* queue full, retry later */ break;
+case CHAN_ERR_CLOSED:     /* channel is closed */ break;
 default: break;
 }
 ```
@@ -149,11 +149,11 @@ if (chan_try_recv(ch, &out) == CHAN_OK)
     printf("recv: %d\n", out);
 ```
 
-### 3. 超时操作
+### 3. Timed Operations
 
 ```c
 int v = 99;
-/* 等待最多 200 毫秒 */
+/* wait at most 200 milliseconds */
 chan_err_t e = chan_send_timeout(ch, &v, 200000000LL);
 if (e == CHAN_ERR_TIMEOUT)
     fprintf(stderr, "send timed out\n");
@@ -162,14 +162,14 @@ int out;
 e = chan_recv_timeout(ch, &out, 200000000LL);
 ```
 
-超时参数单位为**纳秒**：
-- `< 0`：永远等待（等价无超时版本）
-- `== 0`：不等待（等价 `try_*` 版本）
-- `> 0`：指定超时时长
+The timeout argument is in **nanoseconds**:
+- `< 0`: wait forever (equivalent to the no-timeout version)
+- `== 0`: do not wait (equivalent to the `try_*` version)
+- `> 0`: a specified timeout duration
 
-### 4. close 与排空缓冲区（Go 语义）
+### 4. Close and Draining the Buffer (Go Semantics)
 
-关闭有缓冲 channel 后，已存入的数据仍可继续接收，直到排空为止：
+After closing a buffered channel, already-stored data can still be received until it is drained:
 
 ```c
 chan_t *ch = chan_create(sizeof(int), 4);
@@ -177,16 +177,16 @@ for (int i = 0; i < 3; i++) chan_send(ch, &i);
 chan_close(ch);
 
 int v;
-/* 依次收到 0, 1, 2，然后返回 CHAN_ERR_CLOSED */
+/* receive 0, 1, 2 in turn, then return CHAN_ERR_CLOSED */
 while (chan_recv(ch, &v) == CHAN_OK)
     printf("%d\n", v);
 
 chan_destroy(ch);
 ```
 
-### 5. Select 多路复用
+### 5. Select Multiplexing
 
-等价 Go 的 `select` 语句，随机公平选择一个就绪的 case：
+Equivalent to Go's `select` statement, picking a ready case with random fairness:
 
 ```c
 chan_t *timer_ch = chan_create(sizeof(int), 1);
@@ -198,24 +198,24 @@ chan_select_case_t cases[2] = {
     { timer_ch, CHAN_OP_RECV, &timer_val, CHAN_OK },
 };
 
-int w = chan_select(cases, 2);   /* 阻塞直到任一就绪 */
+int w = chan_select(cases, 2);   /* block until any is ready */
 switch (w) {
 case 0: printf("data: %d\n",  data_val);  break;
 case 1: printf("timer fired\n");          break;
-case -1: /* 参数错误 */ break;
+case -1: /* argument error */ break;
 }
 ```
 
-**带超时的 select**（模拟 `time.After`）：
+**Select with a timeout** (emulating `time.After`):
 
 ```c
-/* 等待数据，最多 500ms */
+/* wait for data, at most 500ms */
 int w = chan_select_timeout(cases, 2, 500000000LL);
 if (w == -1)
     printf("timeout or no data\n");
 ```
 
-**非阻塞 select**（等价 `select { … default: }`）：
+**Non-blocking select** (equivalent to `select { … default: }`):
 
 ```c
 int w = chan_select_try(cases, 2);
@@ -223,7 +223,7 @@ if (w == -1)
     printf("no case ready, doing other work\n");
 ```
 
-### 6. 多发送/接收 case 混合
+### 6. Mixed Send/Receive Cases
 
 ```c
 int send_val = 10, recv_val;
@@ -238,51 +238,51 @@ if (w == 1) printf("received %d\n", recv_val);
 
 ---
 
-## 生命周期与线程安全
+## Lifecycle and Thread Safety
 
-### 基本规则
+### Basic Rules
 
 ```c
 chan_t *ch = chan_create(sizeof(int), 8);  /* refcount = 1 */
 
-/* 当多个线程需要各自持有一份引用时 */
+/* when multiple threads each need to hold a reference */
 chan_t *ref2 = chan_retain(ch);            /* refcount = 2 */
 
-/* 每个"持有者"在不再使用时调用 destroy */
+/* each "holder" calls destroy when it is no longer in use */
 chan_destroy(ref2);                        /* refcount = 1 */
-chan_destroy(ch);                          /* refcount = 0 → 释放内存 */
+chan_destroy(ch);                          /* refcount = 0 → frees memory */
 ```
 
-### 契约
+### Contracts
 
-1. 调用 `chan_destroy` 之前，**必须保证本线程对该 channel 的所有操作已经完成**。
-2. 不要在 `chan_destroy` 之后再访问该 channel 指针。
-3. **所有公开函数均线程安全**（内部由 mutex 保护），可从任意线程调用。
-4. `chan_close` 可以从任意线程调用，且幂等（重复调用返回 `CHAN_ERR_CLOSED`，不崩溃）。
+1. Before calling `chan_destroy`, you **must ensure that this thread has completed all operations on the channel**.
+2. Do not access the channel pointer after `chan_destroy`.
+3. **All public functions are thread-safe** (protected internally by a mutex) and can be called from any thread.
+4. `chan_close` can be called from any thread and is idempotent (repeated calls return `CHAN_ERR_CLOSED` and do not crash).
 
 ---
 
-## 错误处理
+## Error Handling
 
-始终检查返回值：
+Always check the return value:
 
 ```c
 chan_err_t e = chan_send(ch, &v);
 if (e != CHAN_OK) {
     fprintf(stderr, "chan_send: %s\n", chan_strerror(e));
-    /* 处理错误 */
+    /* handle the error */
 }
 ```
 
-常见错误码速查：
+Quick reference of common error codes:
 
-| 错误码 | 含义 |
-|--------|------|
-| `CHAN_OK` | 成功 |
-| `CHAN_ERR_CLOSED` | channel 已关闭（发送失败；或接收时已关闭且已排空） |
-| `CHAN_ERR_TIMEOUT` | 超时期限到期 |
-| `CHAN_ERR_WOULDBLOCK` | `try_*` 操作无立即可用的发送/接收方 |
-| `CHAN_ERR_INVALID` | 参数无效（NULL 指针等） |
-| `CHAN_ERR_NOMEM` | `chan_create` 内存分配失败 |
+| Error code | Meaning |
+|------------|---------|
+| `CHAN_OK` | Success |
+| `CHAN_ERR_CLOSED` | The channel is closed (send failed; or, on receive, closed and already drained) |
+| `CHAN_ERR_TIMEOUT` | The timeout deadline expired |
+| `CHAN_ERR_WOULDBLOCK` | A `try_*` operation had no immediately available sender/receiver |
+| `CHAN_ERR_INVALID` | An invalid argument (a NULL pointer, etc.) |
+| `CHAN_ERR_NOMEM` | Memory allocation failed in `chan_create` |
 
-完整说明见 [API Reference](api_reference.md)。
+For full details, see the [API Reference](api_reference.md).

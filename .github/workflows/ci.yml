@@ -40,7 +40,7 @@ jobs:
 
       - name: Report → job summary
         if: always()
-        run: python3 .github/scripts/junit_to_summary.py build/ctest.xml "单元测试 (ctest)" >> "$GITHUB_STEP_SUMMARY"
+        run: python3 .github/scripts/junit_to_summary.py build/ctest.xml "Unit tests (ctest)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload test results
         if: always()
@@ -82,9 +82,9 @@ jobs:
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            echo "### ✅ 消毒器 ${{ matrix.name }} (\`${{ matrix.flags }}\`)：全部通过" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ✅ Sanitizer ${{ matrix.name }} (\`${{ matrix.flags }}\`): all passed" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### ❌ 消毒器 ${{ matrix.name }} (\`${{ matrix.flags }}\`)：失败 — 见日志" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ❌ Sanitizer ${{ matrix.name }} (\`${{ matrix.flags }}\`): failed — see logs" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ── Benchmarks (showcase + cross-language) with regression tracking ──────
@@ -115,10 +115,10 @@ jobs:
       - name: Showcase → job summary + bench.json
         run: |
           {
-            echo "## 性能基准"
-            echo "> ⚠️ GitHub 共享 runner ~4 核、无核绑定,绝对数字会抖动,**仅供趋势参考**。"
+            echo "## Benchmarks"
+            echo "> ⚠️ GitHub shared runner ~4 cores, no core pinning; absolute numbers will jitter, **trend-only reference**."
             echo ""
-            echo "### 性能阶梯 (bench_showcase)"
+            echo "### Performance ladder (bench_showcase)"
             echo '```'
             cat showcase.txt
             echo '```'
@@ -148,9 +148,9 @@ jobs:
           bash bench/crosslang/run_comparison.sh | tee crosslang.txt || true
           {
             echo ""
-            echo "<details><summary>跨语言对比 (libchan vs Go vs crossbeam)</summary>"
+            echo "<details><summary>Cross-language comparison (libchan vs Go vs crossbeam)</summary>"
             echo ""
-            cat doc/comparison.md 2>/dev/null || echo "(comparison.md 未生成)"
+            cat doc/comparison.md 2>/dev/null || echo "(comparison.md not generated)"
             echo ""
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"

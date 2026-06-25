@@ -1,126 +1,135 @@
 # libchan Benchmark Results
 
-**环境**
-- CPU：13th Gen Intel Core i7-13700H（20 逻辑核）
-- OS：WSL2 / Linux 6.6.87.2-microsoft-standard-WSL2
-- 编译器：GCC 13.3.0，`-O3`，`LIBCHAN_SPIN_LIMIT=40`
-- 测试日期：2026-06-24
-- 基准程序：`bench/bench_showcase`（性能阶梯）、`bench/bench_lock_overhead`、`bench/bench_mpmc`
+**Environment**
+- CPU: 13th Gen Intel Core i7-13700H (20 logical cores)
+- OS: WSL2 / Linux 6.6.87.2-microsoft-standard-WSL2
+- Compiler: GCC 13.3.0, `-O3`, `LIBCHAN_SPIN_LIMIT=40`
+- Test date: 2026-06-24
+- Benchmark programs: `bench/bench_showcase` (performance ladder), `bench/bench_lock_overhead`, `bench/bench_mpmc`
 
-**测量方法**
-- 每个数据点跑 7 次，报**中位数**与 **min**（min ≈ 无干扰下界）。
-- `taskset` 钉核运行（`bench/run_showcase.sh`），减少线程迁移抖动。
-- 同时报 **ns/op** 与 **Mops/s**。
-- ⚠️ **WSL2 caveat**：跑在 Windows 调度器之上，含 park 的场景（B 档）抖动明显，数字仅供
-  量级参考；A 档（无锁快路径，不 park）较稳定。严肃测量请在原生 Linux + isolcpus 上跑。
+**Measurement method**
+- Each data point runs 7 times, reporting the **median** and **min** (min ≈ interference-free lower bound).
+- Run with `taskset` core pinning (`bench/run_showcase.sh`) to reduce thread-migration jitter.
+- Reports both **ns/op** and **Mops/s**.
+- ⚠️ **WSL2 caveat**: running on top of the Windows scheduler, park-involving scenarios (Tier B) jitter noticeably, so the numbers are an order-of-magnitude reference only; Tier A (lock-free fast path, no park) is more stable. For serious measurement, run on native Linux + isolcpus.
 
 ---
 
-## 0. 性能阶梯（展示主角）
+## 0. Performance ladder (the main showcase)
 
-`bench/bench_showcase` 把"从硬件极限到完整阻塞路径"串成一条阶梯，让每一层的开销来源
-一目了然。**关键洞察：libchan 的无锁快路径贴近硬件极限；慢的地方是 OS 的 park/调度，
-不是库本身。**
+`bench/bench_showcase` strings "from the hardware floor to the full blocking path" into a single
+ladder, making the source of overhead at each layer obvious at a glance. **Key insight: libchan's
+lock-free fast path is close to the hardware floor; the slow parts are the OS's park/scheduling,
+not the library itself.**
 
-### A 档 · 几乎不 park（测 "channel 本身有多快"）
+### Tier A · almost no park (measures "how fast the channel itself is")
 
-| # | 场景 | 中位 ns | min ns | Mops/s | 这一层加了什么 |
+| # | Scenario | med ns | min ns | Mops/s | What this layer adds |
 |---|------|--------:|-------:|-------:|---------------|
-| 1 | 裸 memcpy | 0.11 | 0.10 | 9487 | 硬件极限 |
-| 2 | atomic_fetch_add | 3.82 | 3.77 | 261 | 无锁原子原语下界 |
-| 3 | 无锁 ring 纯队列 | 14.6 | 14.5 | 68 | 队列数据结构(CAS+内存序+memcpy) |
-| 4 | chan try_send/recv | 25.0 | 24.7 | 40 | + channel 语义(closed 检查/waiter 门槛)，无等待 |
-| 5 | chan **MPMC** 跨核稳态 | 121.4 | 119.4 | 8.2 | + **跨核 cache 一致性**:每条消息读对端反复改写的热游标 ← 物理墙 |
-| 6 | chan **SPSC** 跨核稳态 | 23.9 | 22.1 | 42 | + **游标缓存**:消除弹跳,破墙(同 busy-poll 测法,5×) |
+| 1 | bare memcpy | 0.11 | 0.10 | 9487 | hardware floor |
+| 2 | atomic_fetch_add | 3.82 | 3.77 | 261 | lock-free atomic primitive lower bound |
+| 3 | lock-free ring pure queue | 14.6 | 14.5 | 68 | queue data structure (CAS + memory order + memcpy) |
+| 4 | chan try_send/recv | 25.0 | 24.7 | 40 | + channel semantics (closed check / waiter gate), no wait |
+| 5 | chan **MPMC** cross-core steady-state | 121.4 | 119.4 | 8.2 | + **cross-core cache coherence**: every message reads a hot cursor the peer repeatedly rewrites ← physical wall |
+| 6 | chan **SPSC** cross-core steady-state | 23.9 | 22.1 | 42 | + **cursor caching**: eliminates the bounce, breaks the wall (same busy-poll method, 5×) |
 
-> **怎么读这张表**：
-> - 1→4 全在**单核**完成，无跨核流量：channel 语义只比纯队列贵 ~10 ns，比裸原子贵 ~20 ns，
->   说明 libchan 的快路径几乎没有"软件税"。
-> - 4→5 的跳变（24→121 ns）**不是锁、不是 park**，而是**跨核 cache 一致性**：MPMC 下两个线程在
->   不同核上交替读写同一组 ring 游标，每条消息都触发一次缓存行跨核迁移（~100 ns）。这是
->   **朴素**跨核队列的物理墙(~8 Mops)。
-> - 5→6：`chan_create_spsc` 用**游标缓存**(每侧缓存对端游标的下界,仅在缓存显示满/空时才回读
->   真实热游标)消除这次弹跳——同一 busy-poll 测法下 8→42 Mops（5×），几乎回到单核 try 的量级。
->   单属主缓存只在 SPSC 契约(1 生产者 + 1 消费者)下安全，故为选择性加入。
-> - SPSC **阻塞流式**(B 档 #7)比这里的 busy-poll 稳态还高(73 vs 42)：流式让生产者跑在前面、
->   把游标读取摊薄到一批，而 busy-poll 锁步加剧缓存争用。
+> **How to read this table**:
+> - 1→4 all happen on a **single core**, with no cross-core traffic: channel semantics cost only
+>   ~10 ns more than the pure queue and ~20 ns more than the bare atomic, showing that libchan's
+>   fast path has almost no "software tax."
+> - The 4→5 jump (24→121 ns) is **not the lock, not park**, but **cross-core cache coherence**: under
+>   MPMC two threads on different cores alternately read and write the same set of ring cursors, and
+>   every message triggers one cross-core cache-line migration (~100 ns). This is the physical wall of
+>   a **naive** cross-core queue (~8 Mops).
+> - 5→6: `chan_create_spsc` uses **cursor caching** (each side caches a lower bound of the peer's
+>   cursor, reading back the real hot cursor only when the cache shows full/empty) to eliminate this
+>   bounce —— 8→42 Mops (5×) under the same busy-poll method, nearly back to the single-core try level.
+>   The single-owner cache is safe only under the SPSC contract (1 producer + 1 consumer), so it is opt-in.
+> - SPSC **blocking streaming** (Tier B #7) is even higher than the busy-poll steady-state here (73 vs 42):
+>   streaming lets the producer run ahead and amortizes cursor reads across a batch, whereas lock-step
+>   busy-poll intensifies cache contention.
 
-### B 档 · 阻塞延迟（含 park + OS 调度，仅量级参考）
+### Tier B · blocking latency (includes park + OS scheduling, order-of-magnitude reference only)
 
-| # | 场景 | 中位 ns | min ns | Mops/s | 主导开销 |
+| # | Scenario | med ns | min ns | Mops/s | Dominant overhead |
 |---|------|--------:|-------:|-------:|---------|
-| 7 | chan SPSC 阻塞 cap=1024 | 13.8 | 13.2 | 72.8 | 流式快路径 + 偶发 park（游标缓存生效）|
-| 8 | chan 无缓冲 rendezvous | 285.3 | 259.1 | 3.5 | 每 op 必 park(futex 往返) |
-| 9 | chan MPMC 4P+4C cap=1024 | 208.1 | 162.0 | 4.8 | 竞争 + park + 调度 |
+| 7 | chan SPSC blocking cap=1024 | 13.8 | 13.2 | 72.8 | streaming fast path + occasional park (cursor caching in effect) |
+| 8 | chan unbuffered rendezvous | 285.3 | 259.1 | 3.5 | must park every op (futex round trip) |
+| 9 | chan MPMC 4P+4C cap=1024 | 208.1 | 162.0 | 4.8 | contention + park + scheduling |
 
-> B 档每次操作可能进入内核 park/wake，测的是 **channel 作为同步原语的端到端延迟**，
-> 不是队列本身。这一档主要反映 OS 的 futex + 调度效率（见 §2 futex vs pthread），
-> 跨语言/跨实现比较时尤其要注意它**不可与 A 档同表论高下**。
+> In Tier B each operation may enter a kernel park/wake, so what is measured is the **end-to-end
+> latency of the channel as a synchronization primitive**, not the queue itself. This tier mainly
+> reflects the OS's futex + scheduling efficiency (see §2 futex vs pthread), and when comparing across
+> languages/implementations it especially must **not be ranked in the same table as Tier A**.
 
-### 参考：GitHub Actions 共享 runner（CI 实测）
+### Reference: GitHub Actions shared runner (measured in CI)
 
-CI 每次 push 在 `ubuntu-latest`（~4 逻辑核、虚拟化）上跑同一套 `bench_showcase`。
-绝对数字明显低于上面的开发机（核更少 + 虚拟化调度），**仅供趋势参考**；但阶梯形状与
-"SPSC 破墙、阻塞流式优于 busy-poll" 的结论一致。
+CI runs the same `bench_showcase` suite on `ubuntu-latest` (~4 logical cores, virtualized) on every
+push. The absolute numbers are clearly lower than the dev machine above (fewer cores + virtualized
+scheduling), and are a **trend-only reference**; but the ladder shape and the "SPSC breaks the wall,
+blocking streaming beats busy-poll" conclusions are consistent.
 
-| # | 场景 | 中位 ns | min ns | Mops/s |
+| # | Scenario | med ns | min ns | Mops/s |
 |---|------|--------:|-------:|-------:|
-| 1 | 裸 memcpy | 0.16 | 0.15 | 6315.91 |
+| 1 | bare memcpy | 0.16 | 0.15 | 6315.91 |
 | 2 | atomic_fetch_add | 2.21 | 2.10 | 453.08 |
-| 3 | 无锁 ring 纯队列 | 11.53 | 10.89 | 86.71 |
+| 3 | lock-free ring pure queue | 11.53 | 10.89 | 86.71 |
 | 4 | chan try_send/recv | 19.68 | 19.61 | 50.80 |
-| 5 | chan **MPMC** 跨核稳态（缓存一致性墙） | 176.88 | 171.40 | 5.65 |
-| 6 | chan **SPSC** 跨核稳态（游标缓存破墙） | 63.43 | 63.04 | 15.77 |
-| 7 | chan SPSC 阻塞 cap=1024 | 27.09 | 21.34 | 36.92 |
-| 8 | chan 无缓冲 rendezvous | 701.29 | 696.18 | 1.43 |
+| 5 | chan **MPMC** cross-core steady-state (cache-coherence wall) | 176.88 | 171.40 | 5.65 |
+| 6 | chan **SPSC** cross-core steady-state (cursor caching breaks the wall) | 63.43 | 63.04 | 15.77 |
+| 7 | chan SPSC blocking cap=1024 | 27.09 | 21.34 | 36.92 |
+| 8 | chan unbuffered rendezvous | 701.29 | 696.18 | 1.43 |
 | 9 | chan MPMC 4P+4C cap=1024 | 1002.05 | 680.79 | 1.00 |
 
-> SPSC 跨核(15.77)≈ MPMC 跨核(5.65)的 **2.8×**（开发机 5×；4 核争用把"墙"压扁但仍在）；
-> SPSC 阻塞流式(36.9 Mops)> busy-poll 稳态(15.8)，与开发机同理（生产者跑在前摊薄游标读取）。
-> 实时趋势见 github-action-benchmark 维护的 `gh-pages` 仪表盘。
+> SPSC cross-core (15.77) ≈ **2.8×** of MPMC cross-core (5.65) (5× on the dev machine; 4-core
+> contention flattens the "wall" but it's still there); SPSC blocking streaming (36.9 Mops) >
+> busy-poll steady-state (15.8), for the same reason as on the dev machine (the producer runs ahead and
+> amortizes cursor reads). For the live trend, see the `gh-pages` dashboard maintained by
+> github-action-benchmark.
 
 ---
 
-## 1. Park 后端对比：futex vs pthread
+## 1. Park backend comparison: futex vs pthread
 
-`bench_lock_overhead` 以 futex（Linux 默认）和 pthread condvar（`-DLIBCHAN_FORCE_PTHREAD_PARK=ON`）两种配置各运行一次，每次操作 = send 1 个 int + recv 1 个 int。
+`bench_lock_overhead` runs once each with futex (the Linux default) and pthread condvar
+(`-DLIBCHAN_FORCE_PTHREAD_PARK=ON`), where each operation = send 1 int + recv 1 int.
 
 ```
-场景                                  futex                  pthread condvar
+scenario                              futex                  pthread condvar
                                  ns/op   Mops/s           ns/op   Mops/s
 -------------------------------------------------------------------
-1. 裸 memcpy（基线）              0.10    9579          0.11    9443
+1. bare memcpy (baseline)        0.10    9579          0.11    9443
 2. atomic_fetch_add relaxed      3.86     259          3.86     259
-3. mutex lock+nop+unlock（无竞）  2.64     379          2.57     389
-4. mutex lock+nop+unlock（2线程） 83.2    12.0         92.2    10.9
+3. mutex lock+nop+unlock (uncont) 2.64     379          2.57     389
+4. mutex lock+nop+unlock (2 thr) 83.2    12.0         92.2    10.9
 5. try_send+try_recv cap=1024    25.0    40.0         26.1    38.3
-   （单线程，纯快路径 + fence）
-6a. send+recv cap=1024（1+1线程） 136     7.34          134     7.48
-6b. send+recv 无缓冲（1+1线程）  215     4.65          774     1.29  ← 关键差距
-6c. send+recv cap=1024（2+2线程） 205     4.88          133     7.54
-6d. send+recv cap=1024（4+4线程）2102     0.48         2483     0.40
+   (single thread, pure fast path + fence)
+6a. send+recv cap=1024 (1+1 thr) 136     7.34          134     7.48
+6b. send+recv unbuffered (1+1 thr) 215     4.65          774     1.29  ← key gap
+6c. send+recv cap=1024 (2+2 thr) 205     4.88          133     7.54
+6d. send+recv cap=1024 (4+4 thr) 2102     0.48         2483     0.40
 ```
 
-**关键结论**
+**Key conclusions**
 
-| 场景 | futex | pthread | 比值 |
+| Scenario | futex | pthread | Ratio |
 |------|-------|---------|------|
-| 快路径（try_send+try_recv，无 park） | 25.0 ns | 26.1 ns | ≈1.0× |
-| 有缓冲阻塞（1+1，cap=1024） | 136 ns | 134 ns | ≈1.0× |
-| **无缓冲阻塞（1+1，必须 park）** | **215 ns** | **774 ns** | **futex 快 3.6×** |
-| 有缓冲高竞争（4+4，cap=1024） | 2102 ns | 2483 ns | 量级相当（噪声大） |
+| fast path (try_send+try_recv, no park) | 25.0 ns | 26.1 ns | ≈1.0× |
+| buffered blocking (1+1, cap=1024) | 136 ns | 134 ns | ≈1.0× |
+| **unbuffered blocking (1+1, must park)** | **215 ns** | **774 ns** | **futex 3.6× faster** |
+| buffered high-contention (4+4, cap=1024) | 2102 ns | 2483 ns | comparable order (noisy) |
 
-- **快路径不涉及 park**，两种后端几乎无差异；fence 开销对两者一致。
-- **无缓冲通道强制每次 rendezvous 都走 park/unpark**，futex 系统调用开销（~100 ns）远低于 pthread_cond_wait + 互斥锁序列（~500 ns），差距 **3.6×**。
-- 高竞争场景（2+2、4+4）测量噪声较大（标准差 ±20% 以上），futex/pthread 互有胜负，不宜过度解读。
+- **The fast path does not involve park**, so the two backends are nearly identical; fence overhead is the same for both.
+- **An unbuffered channel forces a park/unpark on every rendezvous**, where the futex syscall overhead (~100 ns) is far below the pthread_cond_wait + mutex sequence (~500 ns), a **3.6×** gap.
+- High-contention scenarios (2+2, 4+4) are noisy (std dev above ±20%); futex/pthread trade wins, so don't over-interpret.
 
 ---
 
-## 2. N×M 生产者-消费者吞吐（Mops/s）
+## 2. N×M producer-consumer throughput (Mops/s)
 
-`bench_mpmc` 固定测量 1500 ms，预热 400 ms，单位 = 完成的 send+recv 对 / 秒。
+`bench_mpmc` measures a fixed 1500 ms with 400 ms warmup, unit = completed send+recv pairs / second.
 
-### capacity = 0（无缓冲，强制 rendezvous）
+### capacity = 0 (unbuffered, forced rendezvous)
 
 ```
             1C      2C      4C      8C
@@ -150,43 +159,46 @@ CI 每次 push 在 `ubuntu-latest`（~4 逻辑核、虚拟化）上跑同一套 
   8P |    0.14    2.80    3.62    3.19
 ```
 
-> 相比 2026-06-22 的数据，有缓冲场景（cap=64/1024）的**直接** send/recv 吞吐有所下降
-> （如 1P+1C cap=1024 从 ~13.6→7.2 Mops/s）。原因是丢唤醒修复后，当对端已 park 时，
-> 快路径会取锁把数据交付给它并唤醒（此前会错过唤醒，是个 bug）。正确唤醒 park 的等待者
-> 本身就有锁开销。需要极限直连吞吐时可改用 `chan_select`（不经此路径）。
+> Compared with the 2026-06-22 data, the **direct** send/recv throughput for buffered scenarios
+> (cap=64/1024) has dropped somewhat (e.g. 1P+1C cap=1024 from ~13.6→7.2 Mops/s). The cause is that
+> after the lost-wakeup fix, when the peer has already parked, the fast path takes the lock to deliver
+> the data to it and wake it (previously the wakeup would be missed — a bug). Correctly waking a parked
+> waiter has lock overhead by itself. When you need maximum direct throughput, switch to `chan_select`
+> (which doesn't go through this path).
 
-**规律总结**
+**Pattern summary**
 
-1. **对角线（nP+nC）吞吐最高**：生产消费平衡，慢路径（park）触发最少。
-2. **严重不对称时吞吐崩溃**（左下角 / 右上角接近 0）：少数一侧成为瓶颈，多余的线程全部 park 等待，park/unpark 开销主导。
-   - 8P+1C：0.15 Mops/s — 8 个生产者争一个消费者，几乎全部时间在 park/wake 循环
-   - 1P+8C：同理，0.15–0.19 Mops/s
-3. **大缓冲（cap=1024）缓解不对称**：吸收突发使不对称时的 park 触发减少，2P+1C 从 10.2→11.5 Mops/s，4P+2C 从 4.87→5.89。
-4. **无缓冲（cap=0）整体较低**：每次 send/recv 均需等待对端，无法并发流水。
-5. **WSL2 高线程数衰减明显**：4P+4C cap=1024（4.56）远低于理论线性扩展（1P+1C×4 = 54.4），主因是单 channel mutex 序列化 + WSL2 线程调度开销。
+1. **The diagonal (nP+nC) has the highest throughput**: balanced production/consumption triggers the slow path (park) least.
+2. **Throughput collapses under severe asymmetry** (lower-left / upper-right corners near 0): the minority side becomes the bottleneck, the surplus threads all park and wait, and park/unpark overhead dominates.
+   - 8P+1C: 0.15 Mops/s — 8 producers contend for one consumer, spending nearly all the time in the park/wake loop
+   - 1P+8C: same, 0.15–0.19 Mops/s
+3. **A large buffer (cap=1024) mitigates asymmetry**: it absorbs bursts so park is triggered less under asymmetry; 2P+1C goes from 10.2→11.5 Mops/s, 4P+2C from 4.87→5.89.
+4. **Unbuffered (cap=0) is lower overall**: every send/recv must wait for the peer, with no concurrent pipelining possible.
+5. **WSL2 degrades noticeably at high thread counts**: 4P+4C cap=1024 (4.56) is far below ideal linear scaling (1P+1C×4 = 54.4), mainly due to single-channel mutex serialization + WSL2 thread-scheduling overhead.
 
 ---
 
-## 3. 重新运行
+## 3. Re-running
 
 ```bash
-# 性能阶梯（A/B 分档，钉核 + 中位数）
+# performance ladder (A/B tiers, core pinning + median)
 bash bench/run_showcase.sh
 
-# Park 对比（futex vs pthread）
+# park comparison (futex vs pthread)
 bash bench/run_park_cmp.sh
 
-# N×M 吞吐
+# N×M throughput
 cmake -B build -DLIBCHAN_BUILD_BENCH=ON && cmake --build build --parallel
 build/bench/bench_mpmc
 ```
 
 ---
 
-## 4. 跨语言对照
+## 4. Cross-language comparison
 
-与 Go 内置 `chan`、Rust `crossbeam-channel` 的对比（direct / spsc / select 三条路径，
-固定消息数 + 精确计数）见 [`comparison.md`](comparison.md)。一句话结论：**按使用形态选路径**——
-单生产单消费直连用 `chan_create_spsc`，吞吐**反超 crossbeam**（与 §0 阶梯 #6 一致）；多生产/
-多消费直连下 crossbeam/Go 更快（libchan 默认 MPMC 为正确性付出 fence + 即时唤醒代价）；
-select 多路复用 libchan 有优势。
+For the comparison with Go's built-in `chan` and Rust's `crossbeam-channel` (three paths: direct /
+spsc / select, fixed message count + exact counting), see [`comparison.md`](comparison.md). One-line
+conclusion: **pick the path by usage shape** —— single-producer single-consumer direct uses
+`chan_create_spsc`, whose throughput **beats crossbeam** (consistent with §0 ladder #6); under
+multi-producer/multi-consumer direct, crossbeam/Go are faster (libchan's default MPMC pays a fence +
+immediate-wakeup cost for correctness); for select multiplexing libchan has the edge.

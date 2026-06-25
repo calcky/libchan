@@ -1,16 +1,19 @@
 /*
  * bench_mpmc.c
  *
- * 非对称 N producer + M consumer 吞吐基准（固定时长测量）。
+ * Asymmetric N producer + M consumer throughput benchmark (fixed-duration
+ * measurement).
  *
- * 每个 (P, C, cap) 组合运行固定时长（MEASURE_MS），统计完成的
- * send/recv 次数，取 min(sends, recvs) 换算为 Mops/s。
- * 高竞争时自然表现为低吞吐，不会卡住。
+ * Each (P, C, cap) combination runs for a fixed duration (MEASURE_MS),
+ * counts the completed send/recv operations, and converts
+ * min(sends, recvs) into Mops/s.
+ * Under high contention this naturally shows up as low throughput rather than
+ * hanging.
  *
- * 停止方式：
- *   1. 置 stop=true（线程在每次操作前检查）
- *   2. chan_close()（唤醒所有阻塞在 chan_send/chan_recv 的线程）
- *   两者都处理 CHAN_ERR_CLOSED，确保线程能够正常退出。
+ * Stop mechanism:
+ *   1. set stop=true (each thread checks before every operation)
+ *   2. chan_close() (wakes all threads blocked in chan_send/chan_recv)
+ *   Both handle CHAN_ERR_CLOSED to ensure threads can exit cleanly.
  */
 
 #define _GNU_SOURCE
@@ -26,7 +29,7 @@
 #include "libchan.h"
 
 /* ------------------------------------------------------------------ */
-/* 参数                                                                 */
+/* parameters                                                          */
 /* ------------------------------------------------------------------ */
 
 #define WARMUP_MS   400
@@ -41,7 +44,7 @@ static const int caps[]      = { 0, 64, 1024 };
 #define N_CAP (int)(sizeof(caps)/sizeof(caps[0]))
 
 /* ------------------------------------------------------------------ */
-/* 计时                                                                 */
+/* timing                                                              */
 /* ------------------------------------------------------------------ */
 
 static inline int64_t now_ms(void) {
@@ -56,7 +59,7 @@ static inline void sleep_ms(int ms) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 线程参数                                                             */
+/* thread arguments                                                    */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -93,7 +96,7 @@ static void *consumer_fn(void *arg) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 单次测试：返回 Mops/s                                               */
+/* single test: returns Mops/s                                         */
 /* ------------------------------------------------------------------ */
 
 static double run_once(int np, int nc, int cap) {
@@ -115,15 +118,15 @@ static double run_once(int np, int nc, int cap) {
     for (int i = 0; i < np; i++) pthread_create(&thr[i],    NULL, producer_fn, &pa);
     for (int i = 0; i < nc; i++) pthread_create(&thr[np+i], NULL, consumer_fn, &ca);
 
-    /* 预热 */
+    /* warmup */
     sleep_ms(WARMUP_MS);
 
-    /* 重置计数，开始测量 */
+    /* reset counters, start measuring */
     atomic_store_explicit(&psent,  0, memory_order_relaxed);
     atomic_store_explicit(&precvd, 0, memory_order_relaxed);
     sleep_ms(MEASURE_MS);
 
-    /* 停止：先 stop 标志再 close 以唤醒阻塞线程 */
+    /* stop: set the stop flag first, then close to wake blocked threads */
     atomic_store_explicit(&stop, true, memory_order_seq_cst);
     chan_close(ch);
 
@@ -143,8 +146,8 @@ static double run_once(int np, int nc, int cap) {
 /* ------------------------------------------------------------------ */
 
 int main(void) {
-    printf("libchan N×M 生产者-消费者吞吐基准\n");
-    printf("预热=%dms  测量=%dms  单位=Mops/s（完成的 send+recv 对）\n\n",
+    printf("libchan N×M producer-consumer throughput benchmark\n");
+    printf("warmup=%dms  measure=%dms  unit=Mops/s (completed send+recv pairs)\n\n",
            WARMUP_MS, MEASURE_MS);
 
     for (int ci = 0; ci < N_CAP; ci++) {
