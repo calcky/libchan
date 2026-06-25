@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782357691635,
+  "lastUpdate": 1782359315486,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -207,6 +207,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.24,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": false,
+          "id": "60a0a0f8677fcfc884ce549a3a25d8d9317edf59",
+          "message": "feat(ring): bulk MPMC enqueue/dequeue to amortize the cross-core wall\n\nAdd ring_lf_enqueue_burst / ring_lf_dequeue_burst: reserve up to n\ncontiguous slots in one CAS, copy the run (wrap-aware, two memcpy when it\ncrosses the power-of-2 boundary), and do one Phase-3 commit. This amortizes\nthe per-op CAS, the cross-core acquire-read of the opposite cursor, and the\nordered commit over the whole batch — per-element cross-core traffic drops\n~1/k — while keeping the single-element reserve→write→commit memory ordering\nverbatim. Burst semantics: move as many as fit/are available up to n, return\nthe count moved (0 when full/empty). MPMC-safe; never touches SPSC caches.\n\nThe 121 ns / 8 Mops single-element MPMC steady-state is a per-CAS/per-commit\nwall, not per-element. bench_bulk shows 2P+2C throughput rising 5.9 → 641\nMops (109x) from batch 1 → 128, far past that wall.\n\n- src/ring_lf.{c,h}: implementation + protocol notes\n- tests/test_bulk.c: wrap FIFO, partial clamp, 4P+4C exactly-once stress\n  (passes under TSan/ASan/UBSan)\n- bench/bench_bulk.c: single-thread + 2P2C amortization across batch sizes\n- doc: benchmarks.md §0.5 + architecture.md further-reading entry\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T11:43:49+08:00",
+          "tree_id": "59d89c98f10bf3450782f0c379866bcdc0e546e1",
+          "url": "https://github.com/calcky/libchan/commit/60a0a0f8677fcfc884ce549a3a25d8d9317edf59"
+        },
+        "date": 1782359314643,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 49.36,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 6.24,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 36.79,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 35.31,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.42,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.61,
             "unit": "Mops/s"
           }
         ]
