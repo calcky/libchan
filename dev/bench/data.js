@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782355015660,
+  "lastUpdate": 1782355523691,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -103,6 +103,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "69097acfc0e5f07854898967150b9393a8940140",
+          "message": "docs/bench: correct ring naming (DPDK rte_ring, not Vyukov) + CI reference table\n\nThe lock-free ring (src/ring_lf.{c,h}) is DPDK rte_ring 4-cursor style, not a\nVyukov per-slot queue. Fix the remaining mislabels that called ring_lf\n\"Vyukov\": the bench_showcase ladder row 3 label + comments, architecture.md,\nand bench/crosslang/README.md. (bench_ring_cmp.c keeps \"Vyukov\" — it really\ndoes compare a Vyukov per-slot impl against the DPDK ring; design.md keeps the\nconceptual \"Vyukov bounded queue\" reference.)\n\nAlso add a \"GitHub Actions shared runner (CI)\" reference table to\nbenchmarks.md §0 with the bench_showcase numbers from CI — clearly marked as a\nseparate, noisier, ~4-core environment (trend-only), distinct from the\ndev-machine ladder.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T10:44:19+08:00",
+          "tree_id": "7a0ddc9cc4b2ad5901909818ae8146e809eafeca",
+          "url": "https://github.com/calcky/libchan/commit/69097acfc0e5f07854898967150b9393a8940140"
+        },
+        "date": 1782355522870,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv（无等待）",
+            "value": 50.8,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC 跨核稳态（缓存一致性墙）",
+            "value": 5.78,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC 跨核稳态（游标缓存破墙）",
+            "value": 17.15,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC 阻塞 cap=1024",
+            "value": 35.85,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan 无缓冲 rendezvous",
+            "value": 1.43,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.63,
             "unit": "Mops/s"
           }
         ]
