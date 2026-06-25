@@ -53,9 +53,19 @@ bool ring_lf_push(chan_ring_lf_t *r, const void *data) {
 
     /* Phase 3 — Commit: wait for our turn, then advance prod.tail.
      * The release store ensures Phase 2 data is visible before prod.tail
-     * is seen by consumers. */
+     * is seen by consumers.
+     *
+     * The wait-load is ACQUIRE, not relaxed: it synchronises-with the
+     * predecessor producer's release-store of prod.tail, so this producer
+     * happens-after every earlier producer's slot write.  That builds a
+     * transitive happens-before chain along prod.tail, so a consumer's
+     * acquire-load of prod.tail orders-after ALL prior producers' writes —
+     * not just the one whose value it happens to read.  Without it, a plain
+     * cross-thread store breaks the C11 release sequence and the slot read
+     * races the slot write (benign on x86 TSO, real on weak memory; TSan
+     * flags it). */
     spin = 0;
-    while (atomic_load_explicit(&r->prod.tail, memory_order_relaxed) != ph)
+    while (atomic_load_explicit(&r->prod.tail, memory_order_acquire) != ph)
         chan_spin_hint(spin++);
     atomic_store_explicit(&r->prod.tail, pnext, memory_order_release);
     return true;
@@ -81,9 +91,13 @@ bool ring_lf_pop(chan_ring_lf_t *r, void *out) {
     /* Phase 2 — Read data from the reserved slot. */
     memcpy(out, r->slots + (ch & r->mask) * r->elem_size, r->elem_size);
 
-    /* Phase 3 — Commit: wait for our turn, then advance cons.tail. */
+    /* Phase 3 — Commit: wait for our turn, then advance cons.tail.
+     * ACQUIRE wait-load (symmetric to ring_lf_push): chains happens-before
+     * along cons.tail so a producer's acquire-load of cons.tail orders-after
+     * ALL prior consumers' slot reads, not just one — preventing a later
+     * producer's slot overwrite from racing an earlier consumer's read. */
     spin = 0;
-    while (atomic_load_explicit(&r->cons.tail, memory_order_relaxed) != ch)
+    while (atomic_load_explicit(&r->cons.tail, memory_order_acquire) != ch)
         chan_spin_hint(spin++);
     atomic_store_explicit(&r->cons.tail, cnext, memory_order_release);
     return true;

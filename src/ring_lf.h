@@ -5,7 +5,7 @@
  *   Phase 1 — Reserve: CAS prod.head old→old+1.
  *             Full check: (prod.head - cons.tail) >= capacity → return false.
  *   Phase 2 — Write:   copy data into slots[(old_head & mask) * elem_size].
- *   Phase 3 — Commit:  spin until prod.tail == old_head,
+ *   Phase 3 — Commit:  spin (acquire-load) until prod.tail == old_head,
  *                       then store_release(prod.tail, old_head+1).
  *
  * Protocol (single-element dequeue) is symmetric using cons.head/cons.tail.
@@ -13,6 +13,14 @@
  * The acquire-load of prod.tail in dequeue Phase 1 synchronises with the
  * producer's release-store of prod.tail, so the data is visible before it
  * is read.  No additional fence is required between Phase 1 and Phase 2.
+ *
+ * The Phase-3 wait-load is ACQUIRE (not relaxed): each producer thus
+ * synchronises-with its predecessor, chaining happens-before along prod.tail
+ * so a consumer ordered-after the latest tail value is ordered-after EVERY
+ * prior producer's slot write — not just the one whose value it read (a plain
+ * cross-thread store would otherwise break the C11 release sequence). Same on
+ * the cons.tail side. Without this, the slot read/write races on weak memory
+ * (benign on x86 TSO; flagged by ThreadSanitizer).
  *
  * Capacity is rounded up to the next power of 2 at init time.
  * uint32_t indices wrap naturally at 2^32; the unsigned subtraction
