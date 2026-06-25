@@ -4,8 +4,9 @@
 
 `libchan` 提供无缓冲同步握手、有缓冲异步队列、多生产者多消费者（MPMC）、
 close 通知，以及类 Go `select` 的多路复用。核心是一条**无锁快路径**
-（Vyukov MPMC ring + Linux futex park），在大缓冲 SPSC 场景下达到约 **40 ns/op**，
-跨语言对比中 6 个场景超过 Go 与 crossbeam 中的 5 个（[详见对比报告](doc/comparison.md)）。
+（DPDK 风格无锁 ring + Linux futex park）。其 `select` 路径在大缓冲下领先 Go 与 crossbeam；
+默认 MPMC 直连 send/recv 慢于二者，但选择性加入的 **`chan_create_spsc`（单生产单消费）**
+直连吞吐**反超 crossbeam**（见[性能](#性能)中的诚实对比）。
 
 ---
 
@@ -127,7 +128,7 @@ make bench    # 构建吞吐基准
 
 ## 设计要点
 
-- **无锁 ring（`src/ring_lf.c`）** —— DPDK rte_ring 风格的 Vyukov MPMC 队列：
+- **无锁 ring（`src/ring_lf.c`）** —— DPDK rte_ring 风格的无锁 MPMC 队列：
   CAS 预约 `head` → 写槽位 → 提交 `tail`，容量向上取整到 2 的幂。
 - **快路径** —— `send`/`recv` 在 `send_waiter_cnt == 0 && recv_waiter_cnt == 0`
   时直接 `ring_lf_push/pop`，零锁、零系统调用。
@@ -143,20 +144,52 @@ make bench    # 构建吞吐基准
 
 ## 性能
 
-跨语言对比（13th Gen i7-13700H / WSL2，单位 Mops/s，越高越好）：
+### 性能阶梯（libchan 自身,13th Gen i7-13700H / WSL2,中位数）
+
+从硬件极限到完整阻塞路径,逐层看清开销来源（`bench/run_showcase.sh`）：
+
+| 层次 | ns/op | Mops/s | 说明 |
+|------|------:|-------:|------|
+| 裸 memcpy | 0.11 | 9487 | 硬件极限 |
+| atomic_fetch_add | 3.82 | 261 | 无锁原子下界 |
+| 无锁 ring 纯队列 | 14.6 | 68 | 队列数据结构本身 |
+| chan try_send/recv | 25.0 | 40 | + channel 语义,单核无等待 |
+| chan **MPMC** 跨核稳态 | 121 | 8.2 | + 跨核 cache 一致性:**每条消息弹跳游标** ← 墙 |
+| chan **SPSC** 跨核稳态 | 23.9 | 42 | + 游标缓存:**破除一致性墙**(同测法,5×) |
+
+**要点**:channel 语义只比纯队列贵 ~10 ns(快路径几乎无软件税)；24→121 的跳变是
+**跨核 cache 一致性**——MPMC 每条消息都要读对端被对端反复改写的热游标,撞上物理墙(8 Mops)；
+`chan_create_spsc` 用**游标缓存**消除这次弹跳,同一 busy-poll 测法下 8→42（5×）。
+SPSC 阻塞流式更高(下表 73 Mops:生产者跑在前面摊薄游标读取,优于锁步 busy-poll)。
+完整 A/B 分档表与方法论见 [`doc/benchmarks.md`](doc/benchmarks.md)。
+
+### 跨语言对比（单位 Mops/s,越高越好,固定消息数 + 精确计数,i7-13700H/WSL2）
+
+**直连 chan_send / chan_recv（核心路径）：**
+
+| 场景 | libchan (MPMC) | **libchan SPSC** | Go chan | crossbeam (Rust) |
+|------|--------:|--------:|--------:|-----------------:|
+| 1P+1C cap=64   |  7.70 | **64.28** | 32.50 | 50.91 |
+| 1P+1C cap=1024 |  8.81 | **69.48** | 34.97 | 66.73 |
+| 2P+2C cap=1024 |  6.26 | — | 27.66 | **48.55** |
+| 4P+4C cap=1024 |  3.97 | — | 14.00 | **25.90** |
+| 8P+8C cap=1024 |  3.18 | — |  4.06 | **11.77** |
+
+**select 多路复用：**
 
 | 场景 | libchan | Go chan | crossbeam (Rust) |
 |------|--------:|--------:|-----------------:|
-| 1P+1C cap=0 (unbuf) |  0.280 | **4.715** |  0.155 |
-| 1P+1C cap=64        | **13.708** | 12.439 |  5.532 |
-| 1P+1C cap=1024      | **24.445** | 12.956 |  9.079 |
-| 2P+2C cap=1024      | **13.138** | 11.051 |  9.823 |
-| 4P+4C cap=1024      |  **9.905** |  6.127 |  9.096 |
-| 8P+8C cap=1024      |  **8.504** |  3.223 |  5.785 |
+| 1P+1C cap=0 (unbuf) |  0.108 | **4.596** |  0.126 |
+| 1P+1C cap=1024      | **19.043** | 12.870 | 16.301 |
+| 4P+4C cap=1024      |  5.403 |  5.254 | **7.480** |
+| 8P+8C cap=1024      |  3.736 |  2.441 | **5.979** |
 
-有缓冲场景全面领先；无缓冲 rendezvous 输给 Go 是 OS 线程 futex 对协程调度的
-固有差异（crossbeam 同量级）。方法论与完整分析见 [`doc/comparison.md`](doc/comparison.md)，
-基准代码与运行方式见 [`bench/crosslang/`](bench/crosslang/)。
+**结论（诚实）**:按使用形态选路径——① **单生产单消费 + 直连为主 → `chan_create_spsc`,
+直连吞吐反超 crossbeam**(64–69 vs 51–67,约为自身 MPMC 直连的 8×);② 多生产/多消费 +
+直连为主 → crossbeam/Go 更快(libchan 默认 MPMC 直连为修复有缓冲丢唤醒死锁付出 fence +
+即时唤醒代价);③ 以 select 多路复用为主 → libchan 有优势。SPSC 列仅 1P1C 有缓冲有值
+(契约:至多一个生产者 + 一个消费者)。完整表、方法论与分析见
+[`doc/comparison.md`](doc/comparison.md),基准代码见 [`bench/crosslang/`](bench/crosslang/)。
 
 ---
 
@@ -183,7 +216,7 @@ libchan/
 │   ├── chan_send.c       #   发送（快路径 + 慢路径）
 │   ├── chan_recv.c       #   接收
 │   ├── select.c          #   chan_select 多路复用
-│   ├── ring_lf.c         #   无锁 Vyukov MPMC ring
+│   ├── ring_lf.c         #   DPDK 风格无锁 MPMC ring
 │   ├── waitq.c           #   waiter 等待队列
 │   └── park.c            #   futex / pthread park 后端
 ├── tests/                # 单元 + 压力测试

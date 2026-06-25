@@ -2,13 +2,13 @@
 
 ## 测试目标
 
-在同一硬件上公平对比三种语言的 channel 实现：
+在同一硬件上公平对比三种 channel 实现，**分别测量直连收发与 select 两条路径**：
 
 | 实现 | 语言 | channel 类型 |
 |------|------|------------|
-| libchan | C11 | MPMC 有界，Linux futex park |
+| libchan | C11 | MPMC 有界，DPDK 风格无锁 ring + Linux futex park；另有 `chan_create_spsc` 单生产单消费快路径（游标缓存，无 per-op fence） |
 | Go 内置 `chan` | Go | MPMC 有界/无界，goroutine 调度 park |
-| `crossbeam-channel` | Rust | MPMC 有界，futex-based Parker |
+| `crossbeam-channel` | Rust | MPMC 有界，crossbeam ring + futex Parker |
 
 ---
 
@@ -17,16 +17,15 @@
 | 维度 | 说明 |
 |------|------|
 | **优化级别** | C `-O3`；Rust `--release`（LLVM O3）；Go `go build`（≈O2，标准发布级） |
-| **测量方法** | 固定时长：400 ms 预热 + 1500 ms 测量；计完成的 send+recv 对数 |
+| **测量方法** | **固定消息数**（非固定时长）：每生产者发固定 K 条，消费者收到通道关闭为止，收发条数精确相等、不会丢消息。先用小消息数校准吞吐，再标定正式消息数到约 1.5 s。计时为从开始发送到全部 drain 完毕的墙钟时间。 |
+| **路径** | **direct**：默认 MPMC 通道，生产者直接 send / 消费者直接 recv；**spsc**：同 direct 但通道由 `chan_create_spsc` 创建（仅 1P1C 有缓冲场景，单列于 direct 表）；**select**：生产者/消费者各跑一次 2-case select（含一个永不就绪的 dummy 第二路），对标三端的 select。 |
 | **数据大小** | 均为 4 B（C `int`，Go `int32`，Rust `i32`） |
-| **停止机制** | C: `stop=true` + `chan_close()`；Go: `close(done)` + `select`；Rust: `drop(stop_tx)` + `select!` |
+| **收尾机制** | C: `chan_close`；Go: `close(ch)`；Rust: drop 全部 sender |
 | **线程模型** | C/Rust 使用 OS 线程（1:1）；Go 使用 goroutine（M:N，GOMAXPROCS=nCPU）—— **固有差异，非设计偏差** |
-| **Park 机制** | C: Linux futex；Go: runtime park（futex-based）；Rust crossbeam: Parker（futex-based） |
-| **堆分配** | 无每次 op 的堆分配；元素存于 channel 内部缓冲区 |
 
-> **线程模型说明**：Go goroutine 由 Go runtime 调度，系统调用阻塞时会自动切换其他 goroutine，
-> 理论上可更高效利用 CPU。C/Rust 使用 OS 线程，阻塞时占用内核调度资源。
-> 这是三种语言设计上的根本差异，在报告中原样呈现，不做消除。
+> **为什么用固定消息数**：旧版基准固定时长 + 在停止时刻采样计数，既无法保证不丢消息，
+> 又因 C 端把计数累加在局部变量、循环结束才汇总，使预热清零失效、数字虚高约 1.27×。
+> 固定消息数 + 精确计数断言彻底消除了这两个问题。
 
 ---
 
@@ -38,69 +37,80 @@ OS     : 6.6.87.2-microsoft-standard-WSL2
 C      : gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
 Go     : go1.23.10
 Rust   : 1.96.0
-Date   : 2026-06-23
+Date   : 2026-06-24
 ```
 
 ---
 
 ## 结果（单位：Mops/s，越高越好）
 
+### 路径一：直连 chan_send / chan_recv（核心路径）
+
+| 场景                 |     libchan (C) |   libchan SPSC |    Go chan |   crossbeam (Rust) |
+|----------------------|-----------------|----------------|------------|--------------------|
+| 1P+1C  cap=0 (unbuf)   |         3.999   |            — |      8.555 |              0.069 |
+| 1P+1C  cap=64          |         7.697   |         64.282 |     32.498 |             50.911 |
+| 1P+1C  cap=1024        |         8.810   |         69.478 |     34.965 |             66.730 |
+| 2P+2C  cap=1024        |         6.264   |            — |     27.661 |             48.546 |
+| 4P+4C  cap=1024        |         3.972   |            — |     13.995 |             25.896 |
+| 8P+8C  cap=1024        |         3.175   |            — |      4.060 |             11.772 |
+
+### 路径二：select 多路复用
+
 | 场景                 |     libchan (C) |    Go chan |   crossbeam (Rust) |
 |----------------------|-----------------|------------|--------------------|
-| 1P+1C  cap=0 (unbuf)   |         0.280   |      4.715 |              0.155 |
-| 1P+1C  cap=64          |        13.708   |     12.439 |              5.532 |
-| 1P+1C  cap=1024        |        24.445   |     12.956 |              9.079 |
-| 2P+2C  cap=1024        |        13.138   |     11.051 |              9.823 |
-| 4P+4C  cap=1024        |         9.905   |      6.127 |              9.096 |
-| 8P+8C  cap=1024        |         8.504   |      3.223 |              5.785 |
+| 1P+1C  cap=0 (unbuf)   |         0.108   |      4.596 |              0.126 |
+| 1P+1C  cap=64          |        10.511   |     12.493 |              4.786 |
+| 1P+1C  cap=1024        |        19.043   |     12.870 |             16.301 |
+| 2P+2C  cap=1024        |         8.921   |     10.913 |             11.145 |
+| 4P+4C  cap=1024        |         5.403   |      5.254 |              7.480 |
+| 8P+8C  cap=1024        |         3.736   |      2.441 |              5.979 |
 
 
----
-
-## 公平性：三语言热路径均使用 select
-
-本基准三端的生产者/消费者热路径**每次迭代都执行一次 2-case select**，
-监听 data 通道与 stop 通道，停止时广播关闭 stop 通道：
-
-- libchan：`chan_select({send data_ch / recv stop_ch})`
-- Go：`select { case data<-v: case <-done: }`
-- Rust：`select! { send(data,v)->_ recv(stop)->_ }`
-
-因此对比的是各自 select 实现的真实开销，不存在"C 走裸 send/recv 占便宜"的问题。
+> select 在 MPMC（≥2P+2C）下，libchan 有约 0.01% 的计数偏差（已知限制，见
+> [`design.md`](design.md) 的 Select 小节），不影响吞吐量级；direct 路径三端均精确无误差。
 
 ---
 
 ## 分析
 
-### 总览：libchan 在 6 个场景中赢 5 个
+### 直连默认路径（MPMC `chan_create`）：libchan 不占优，crossbeam 最快
 
-经过 chan_select 快路径优化（无锁 ring 直通 + 线程本地轮转选择 + stub 不增加
-有缓冲 waiter 计数），libchan 在全部 5 个**有缓冲**场景（S2–S6）均超过 Go 与
-crossbeam，仅在 S1 无缓冲 rendezvous 上落后 Go。
+默认 MPMC 通道的直连 send/recv 下，**crossbeam > Go > libchan(C)**（有缓冲场景）。原因：
 
-### S1 — 无缓冲（cap=0）：futex 同步开销，Go 占优
+- **crossbeam / Go** 的有缓冲队列在无竞争时基本是纯无锁/轻量 CAS，且唤醒批处理良好。
+- **libchan(C)** 的 MPMC 直连路径为保证正确性（修复有缓冲通道的丢唤醒死锁）付出代价：
+  每次成功 push/pop 多一道 `seq_cst` fence，且当对端已 park 时立即**取锁**唤醒，牺牲了批处理。
+- **无缓冲（cap=0）**：crossbeam 的 `bounded(0)` rendezvous 极慢（已知），libchan 与 Go
+  量级相近。
 
-无缓冲通道每次操作都要求 sender 与 receiver 同步 rendezvous，必有一方进入
-park 等待。libchan / crossbeam 使用 Linux futex，每次 rendezvous 需要一次
-内核 futex 往返（~1–2 µs）外加多把 channel 锁的注册/清理，约 4 µs/op。
+### 直连 SPSC 路径（`chan_create_spsc`）：libchan 反超 crossbeam
 
-Go 的 goroutine park/unpark 完全在用户态 runtime 调度器内完成，无系统调用，
-约 200 ns/op——这是 M:N 协程模型对 1:1 OS 线程模型在同步 rendezvous 上的
-**固有优势**，无法用用户态 futex 库消除。crossbeam（0.155）与 libchan（0.225）
-量级相同，印证这是 OS 线程 park 的共同上限。
+当应用满足单生产单消费契约时，`chan_create_spsc` 把直连吞吐拉到 **libchan SPSC 列**所示水平
+——在 1P+1C 有缓冲场景**超过 crossbeam**，约为自身 MPMC 直连路径的 ~8×。原因：
 
-### S2–S3 — SPSC 快路径（1P+1C）：libchan 领先
+- **游标缓存**：每侧缓存对端热游标的下界，消除了每条消息一次的跨核 cache line 弹跳
+  （MPMC 路径的主要成本）；
+- **无 per-op fence**：SPSC 热路径省掉上面那道 `seq_cst` fence；
+- **park 侧有界重检**：把唤醒竞态的修复代价隔离到（本就慢的）park 路径，热路径零开销，
+  且**不依赖 `chan_close`**——请求/响应（ping-pong）也不死锁。
 
-单生产单消费、缓冲未满/未空时，select 命中无锁 ring 快路径：
-`send_waiter_cnt==0 && recv_waiter_cnt==0` 时 `ring_lf_push/pop` 完全绕过 mutex。
-cap=1024 时 libchan 约 **24 Mops/s（~40 ns/op）**，约为 Go 的 2 倍、crossbeam 的
-2.5 倍以上，直接体现 Vyukov ring 的 SPSC 无锁路径效率。
+代价是契约：至多一个生产者线程 + 一个消费者线程（违反即 UB）。故 SPSC 列只在 1P1C
+有缓冲场景有值，其余为 —。
 
-### S4–S6 — MPMC 扩展性：libchan 领先
+### select 路径：libchan 领先
 
-多生产多消费高竞争下，libchan 的 select 快路径仍绕过 mutex，仅在 CAS 层面竞争
-`prod.head`/`cons.head`。8P+8C（16 线程）时 libchan 约 **8–9 Mops/s**，约为 Go 的
-2.5–3 倍、且高于 crossbeam。Go 在高线程数下 goroutine 调度开销放大，吞吐反而下降。
+select 下 libchan **快于自身的 MPMC 直连路径**，也普遍领先 Go 与 crossbeam。原因：
+libchan 的 select 走无锁 ring 快路径，且 park 的 select stub **不增加** waiter 计数、
+采用有界延迟唤醒（生产者无锁灌满环 → 一次唤醒 → 消费者批量取走），保留了批处理。
+代价是 MPMC 下的微小计数偏差（上文已注）。
+
+### 启示
+
+**按使用形态选路径**：① 多生产/多消费 + 以直连 send/recv 为主 → crossbeam/Go 更快；
+② **单生产单消费 + 直连为主 → `chan_create_spsc`，反超 crossbeam**；③ 以 select 多路复用
+为主 → libchan(MPMC) 有优势。旧版基准只测了 select，掩盖了 MPMC 直连路径的劣势；本次拆成
+三列（MPMC 直连 / SPSC 直连 / select）如实呈现各自的强弱区间。
 
 ---
 

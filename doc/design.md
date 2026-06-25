@@ -135,6 +135,48 @@ send(data):
 
 ---
 
+## SPSC 快速模式（`chan_create_spsc`）
+
+`chan_create_spsc(elem_size, capacity)` 创建一个**选择性加入**的单生产者单消费者通道。
+契约：**至多一个生产者线程 + 一个消费者线程**（违反即 UB）。满足契约时，它在并发流式
+负载下的吞吐可达默认 MPMC 通道的约 9 倍（i7-13700H 上 ~73 Mops vs ~8 Mops，持平
+Rust crossbeam）。它**不要求也不依赖 `chan_close`**——适合进程内长生命周期、永不关闭的
+线程间通道。
+
+**为什么快 —— 游标缓存（cursor caching）**：默认 MPMC ring 每次操作都要 acquire-load
+对端的热游标（生产者读 `cons.tail`、消费者读 `prod.tail`），而该游标被对端每次操作 release-
+store，于是每条消息都触发一次跨核 cache line 弹跳（在本机约 ~100 ns）。SPSC 模式让每一侧
+缓存对端游标的一个**下界**，仅当缓存显示"可能满/空"时才回读真实游标。单属主缓存
+（`prod.cached_cons_tail` 只被生产者读写，`cons.cached_prod_tail` 只被消费者读写）使得
+"槽位数据 happens-before 对端可见"链条保持完整——这正是 MPMC 下共享缓存**不**安全、而
+SPSC 下安全的根本原因。详见 `src/ring_lf.h` 的 SAFETY CONTRACT 与 `ring_spsc_push/pop`。
+
+**为什么省掉 per-op fence**：上一节的 Dekker 屏障要求快路径每次成功操作多一道 `seq_cst`
+fence（~+7 ns/op）。SPSC 模式在热路径上**省掉这道 fence**（生产者/消费者各只剩 relaxed
+的对端计数检查），把吞吐推过 Rust。代价是：一次 push/pop 若恰好与对端的"注册并 park"
+撞上 StoreLoad 竞态窗口（亚微秒级），可能漏掉这次唤醒。流式负载下"下一次 push/pop"就会
+补上；但在**请求/响应（ping-pong）**模式下，发起方在拿到响应前不会再发，漏唤醒会变成
+**永久死锁**。
+
+**park 侧有界重检（backstop）——在不依赖 close、不动热路径的前提下消除死锁**：无限等待的
+SPSC park **不**直接无限睡眠，而是先用一个有界超时 `LIBCHAN_SPSC_PARK_BACKSTOP_NS`
+（默认 1 ms）park；超时醒来后**持锁重检一次** ring：
+- 抓到那条漏唤醒的 push/pop → 取走，返回；
+- 通道已关闭 → 返回 CLOSED；
+- 确认仍空/满 → 重新入队并**无限 park**。
+
+正确性：竞态只属于"刚写入、尚在传播中"的等待计数；一旦重检确认对端状态未变，该计数已
+稳定可见远超任何传播延迟，**之后任意一次对端操作的 relaxed 读都必然看到它并唤醒**——因此
+此后的无限 park 安全，不再需要任何超时。净效果：每个 park 回合**至多多醒一次**（约 1 ms 后），
+随后静默；**不是轮询**。热路径（快路径自旋 + 无锁收发）一字未改，吞吐不受影响。该协议在
+send/recv 两侧对称实现，见 `src/chan_send.c` / `src/chan_recv.c` 的 `ch->spsc && timeout_ns < 0`
+分支。
+
+> 验证：ping-pong 死锁压测 400 万回合 + ASan/UBSan + TSan（0 data race）+ futex/pthread
+> 两种 park 后端；SPSC checksum cap=1/64/1024 各 ×30 零错误。
+
+---
+
 ## 接收路径（`src/chan_recv.c`）
 
 ### 无缓冲
@@ -329,6 +371,14 @@ unlock_all
 > **规避**：用 `chan_close` 表示"发送完毕"（Go 的通用惯例)。close 一定会唤醒所有 park 的 select，彻底规避此问题。实践中几乎所有 select 用法都以 close 收尾，因此该限制极少触及。
 >
 > 直连 `chan_send`/`chan_recv`（非 select）**不受此限制**——它们的等待者增加 waiter 计数 + `seq_cst` 握手，会被及时唤醒（见上文发送路径的"避免丢唤醒"小节）。彻底修复 select 的延迟唤醒需要在不破坏批处理快路径的前提下唤醒存根，是一项独立的设计工作。
+
+### 7. 已知限制：select MPMC 下的微小计数偏差
+
+在 **≥2 生产者 + 2 消费者**且全部走 select 的高竞争场景下，存在约 **0.01% 的计数偏差**（收到条数略多于发送条数）。根因：`execute_case_locked` 的 SEND 分支在 `ring_push` 成功后会唤醒一个 park 的接收存根并置 `result=CHAN_OK`，但数据其实进了环（由其他消费者弹出），被唤醒的存根却把这次唤醒当作"收到一条"计入——形成一次重复计数。
+
+这与 §6 的有界延迟唤醒协议**深度耦合**：要彻底修复需重做 select 的唤醒/认领协议（曾尝试，导致死锁 + 吞吐下降 2–3×，已回退）。鉴于偏差极小（0.01%）、仅影响精确计数而非吞吐量级、且只在"全 select 的 MPMC"下出现，当前**记录为已知限制**而非强行修复。
+
+> **不受影响**：直连 `chan_send`/`chan_recv` 在任意 MPMC 配置下计数精确（已用固定消息数基准 120/120 组验证）；单生产单消费（SPSC）的 select 也精确。
 
 ---
 

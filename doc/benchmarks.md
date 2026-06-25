@@ -4,13 +4,58 @@
 - CPU：13th Gen Intel Core i7-13700H（20 逻辑核）
 - OS：WSL2 / Linux 6.6.87.2-microsoft-standard-WSL2
 - 编译器：GCC 13.3.0，`-O3`，`LIBCHAN_SPIN_LIMIT=40`
-- 测试日期：2026-06-23
-- 基准程序：`bench/bench_lock_overhead`、`bench/bench_mpmc`
+- 测试日期：2026-06-24
+- 基准程序：`bench/bench_showcase`（性能阶梯）、`bench/bench_lock_overhead`、`bench/bench_mpmc`
 
-> **注**：自 2026-06-23 起，`chan_send`/`chan_recv` 的无锁快路径在每次成功 push/pop
-> 后多了一道 `seq_cst` fence（修复丢唤醒死锁的握手，见 [`architecture.md`](architecture.md)）。
-> 这给**直接** send/recv 的快路径增加了约 7 ns/op（纯快路径 try 从 ~17.5→25 ns）。
-> 跨语言对比（[`comparison.md`](comparison.md)）走 `chan_select`，不经过该 fence，吞吐不受影响。
+**测量方法**
+- 每个数据点跑 7 次，报**中位数**与 **min**（min ≈ 无干扰下界）。
+- `taskset` 钉核运行（`bench/run_showcase.sh`），减少线程迁移抖动。
+- 同时报 **ns/op** 与 **Mops/s**。
+- ⚠️ **WSL2 caveat**：跑在 Windows 调度器之上，含 park 的场景（B 档）抖动明显，数字仅供
+  量级参考；A 档（无锁快路径，不 park）较稳定。严肃测量请在原生 Linux + isolcpus 上跑。
+
+---
+
+## 0. 性能阶梯（展示主角）
+
+`bench/bench_showcase` 把"从硬件极限到完整阻塞路径"串成一条阶梯，让每一层的开销来源
+一目了然。**关键洞察：libchan 的无锁快路径贴近硬件极限；慢的地方是 OS 的 park/调度，
+不是库本身。**
+
+### A 档 · 几乎不 park（测 "channel 本身有多快"）
+
+| # | 场景 | 中位 ns | min ns | Mops/s | 这一层加了什么 |
+|---|------|--------:|-------:|-------:|---------------|
+| 1 | 裸 memcpy | 0.11 | 0.10 | 9487 | 硬件极限 |
+| 2 | atomic_fetch_add | 3.82 | 3.77 | 261 | 无锁原子原语下界 |
+| 3 | 无锁 ring 纯队列 | 14.6 | 14.5 | 68 | 队列数据结构(CAS+内存序+memcpy) |
+| 4 | chan try_send/recv | 25.0 | 24.7 | 40 | + channel 语义(closed 检查/waiter 门槛)，无等待 |
+| 5 | chan **MPMC** 跨核稳态 | 121.4 | 119.4 | 8.2 | + **跨核 cache 一致性**:每条消息读对端反复改写的热游标 ← 物理墙 |
+| 6 | chan **SPSC** 跨核稳态 | 23.9 | 22.1 | 42 | + **游标缓存**:消除弹跳,破墙(同 busy-poll 测法,5×) |
+
+> **怎么读这张表**：
+> - 1→4 全在**单核**完成，无跨核流量：channel 语义只比纯队列贵 ~10 ns，比裸原子贵 ~20 ns，
+>   说明 libchan 的快路径几乎没有"软件税"。
+> - 4→5 的跳变（24→121 ns）**不是锁、不是 park**，而是**跨核 cache 一致性**：MPMC 下两个线程在
+>   不同核上交替读写同一组 ring 游标，每条消息都触发一次缓存行跨核迁移（~100 ns）。这是
+>   **朴素**跨核队列的物理墙(~8 Mops)。
+> - 5→6：`chan_create_spsc` 用**游标缓存**(每侧缓存对端游标的下界,仅在缓存显示满/空时才回读
+>   真实热游标)消除这次弹跳——同一 busy-poll 测法下 8→42 Mops（5×），几乎回到单核 try 的量级。
+>   单属主缓存只在 SPSC 契约(1 生产者 + 1 消费者)下安全，故为选择性加入。
+> - SPSC **阻塞流式**(B 档 #7)比这里的 busy-poll 稳态还高(73 vs 42)：流式让生产者跑在前面、
+>   把游标读取摊薄到一批，而 busy-poll 锁步加剧缓存争用。
+
+### B 档 · 阻塞延迟（含 park + OS 调度，仅量级参考）
+
+| # | 场景 | 中位 ns | min ns | Mops/s | 主导开销 |
+|---|------|--------:|-------:|-------:|---------|
+| 7 | chan SPSC 阻塞 cap=1024 | 13.8 | 13.2 | 72.8 | 流式快路径 + 偶发 park（游标缓存生效）|
+| 8 | chan 无缓冲 rendezvous | 285.3 | 259.1 | 3.5 | 每 op 必 park(futex 往返) |
+| 9 | chan MPMC 4P+4C cap=1024 | 208.1 | 162.0 | 4.8 | 竞争 + park + 调度 |
+
+> B 档每次操作可能进入内核 park/wake，测的是 **channel 作为同步原语的端到端延迟**，
+> 不是队列本身。这一档主要反映 OS 的 futex + 调度效率（见 §2 futex vs pthread），
+> 跨语言/跨实现比较时尤其要注意它**不可与 A 档同表论高下**。
 
 ---
 
@@ -103,10 +148,23 @@
 ## 3. 重新运行
 
 ```bash
-# Park 对比（需 CMake + GCC）
+# 性能阶梯（A/B 分档，钉核 + 中位数）
+bash bench/run_showcase.sh
+
+# Park 对比（futex vs pthread）
 bash bench/run_park_cmp.sh
 
-# N×M 吞吐（约 90 秒）
+# N×M 吞吐
 cmake -B build -DLIBCHAN_BUILD_BENCH=ON && cmake --build build --parallel
 build/bench/bench_mpmc
 ```
+
+---
+
+## 4. 跨语言对照
+
+与 Go 内置 `chan`、Rust `crossbeam-channel` 的对比（direct / spsc / select 三条路径，
+固定消息数 + 精确计数）见 [`comparison.md`](comparison.md)。一句话结论：**按使用形态选路径**——
+单生产单消费直连用 `chan_create_spsc`，吞吐**反超 crossbeam**（与 §0 阶梯 #6 一致）；多生产/
+多消费直连下 crossbeam/Go 更快（libchan 默认 MPMC 为正确性付出 fence + 即时唤醒代价）；
+select 多路复用 libchan 有优势。
