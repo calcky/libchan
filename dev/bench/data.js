@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782370595321,
+  "lastUpdate": 1782372366952,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -363,6 +363,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 2.08,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "99686bc778da89170b093b55cd7e866f45265ec6",
+          "message": "docs: add CI + benchmark-trend badges and a link to the per-commit dashboard\n\nTop-of-README badges for the GitHub Actions CI status and the benchmark trend\ndashboard, plus a pointer in the Performance section to the interactive\nper-commit charts on gh-pages (click a point to open its commit).\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-25T15:25:05+08:00",
+          "tree_id": "60149254e6fc87b28a9cb9f6f14708a8621807c2",
+          "url": "https://github.com/calcky/libchan/commit/99686bc778da89170b093b55cd7e866f45265ec6"
+        },
+        "date": 1782372366088,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 48.69,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 6.06,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 35.97,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 35.48,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.48,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.39,
             "unit": "Mops/s"
           }
         ]
