@@ -2,6 +2,9 @@
 
 > A high-performance channel library in pure C11 — bringing Go / Rust channel semantics to C.
 
+[![CI](https://github.com/calcky/libchan/actions/workflows/ci.yml/badge.svg)](https://github.com/calcky/libchan/actions/workflows/ci.yml)
+[![Benchmark trend](https://img.shields.io/badge/benchmark-trend-2da44e?logo=github)](https://calcky.github.io/libchan/dev/bench/)
+
 `libchan` provides unbuffered synchronous handoff, buffered asynchronous queues, multi-producer
 multi-consumer (MPMC), close notification, and Go-like `select` multiplexing. At its core is a
 **lock-free fast path** (DPDK-style lock-free ring + Linux futex park). Its `select` path beats Go
@@ -144,6 +147,10 @@ For architecture details, see [`doc/design.md`](doc/design.md).
 ---
 
 ## Performance
+
+> 📈 **Per-commit trend:** every push to `master` records throughput on CI; browse the interactive
+> per-commit charts (click a point to open its commit) at
+> **[calcky.github.io/libchan/dev/bench](https://calcky.github.io/libchan/dev/bench/)**.
 
 ### Performance ladder (libchan itself, 13th Gen i7-13700H / WSL2, median)
 
