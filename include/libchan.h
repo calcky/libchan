@@ -39,6 +39,21 @@ typedef enum {
  * Returns NULL on allocation failure.  Initial refcount is 1. */
 LIBCHAN_API chan_t *chan_create(size_t elem_size, size_t capacity);
 
+/* Like chan_create, but enables a single-producer-single-consumer fast path
+ * (cursor-cached ring ops) that is markedly faster for buffered throughput.
+ *
+ * CONTRACT: the caller guarantees AT MOST ONE producer thread and AT MOST ONE
+ * consumer thread use the channel concurrently.  Using it with multiple
+ * producers or multiple consumers is undefined behaviour (data corruption on
+ * weakly-ordered CPUs).  For capacity == 0 it behaves exactly like
+ * chan_create (the SPSC optimisation only applies to buffered rings).
+ *
+ * Blocking chan_send/chan_recv on an SPSC channel are deadlock-free WITHOUT any
+ * reliance on chan_close, including request/response (ping-pong) patterns: a
+ * parked waiter is always recovered (see the park-side backstop in design.md).
+ * Suitable for long-lived, never-closed in-process thread-to-thread channels. */
+LIBCHAN_API chan_t *chan_create_spsc(size_t elem_size, size_t capacity);
+
 /* Decrement refcount; free when it reaches zero. */
 LIBCHAN_API void    chan_destroy(chan_t *ch);
 

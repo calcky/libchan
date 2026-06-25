@@ -4,26 +4,52 @@ chan_err_t chan_recv_impl(chan_t *ch, void *out, int64_t timeout_ns) {
     if (!ch || !out) return CHAN_ERR_INVALID;
 
     /*
-     * Buffered fast path (lock-free).
+     * Buffered fast path (lock-free), with bounded spin before parking.
      *
-     * Same guard as the sender: both waiter counts must be zero.  When
-     * send_waiter_cnt > 0 we use the slow path so that the "receiver helps
-     * push" pattern below is safe from concurrent fast-path senders.
+     * Retrying the lock-free pop a few times on a transiently-empty ring keeps
+     * recv_waiter_cnt at 0, so a concurrent producer stays on ITS fast path and
+     * can run ahead instead of being dragged onto the locked slow path the
+     * instant we would otherwise park.  This is what lets a buffered pipeline
+     * actually pipeline (producer fills while we briefly spin), rather than
+     * ping-ponging through park on every message.
+     *
+     * Bail out of the spin immediately if any waiter is registered (a parked
+     * sender must be served via the slow path) or the channel is closed.
      */
-    if (ch->capacity > 0 &&
-        atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) == 0 &&
-        atomic_load_explicit(&ch->recv_waiter_cnt, memory_order_relaxed) == 0) {
-        if (ring_lf_pop(&ch->ring, out)) {
-            /* We freed a ring slot.  A sender may have registered & parked
-             * (ring was full) in the lock-free window.  Pair a seq_cst fence
-             * with the sender's seq_cst registration so we never both miss:
-             * admit a parked sender into the slot we just freed. */
-            atomic_thread_fence(memory_order_seq_cst);
-            if (atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) != 0)
-                chan_admit_senders_to_ring(ch);
-            return CHAN_OK;
+    if (ch->spsc) {
+        /* Dedicated lean SPSC consumer fast path.  Single consumer ⇒ skip the
+         * recv_waiter_cnt check; pop first and only check send_waiter_cnt (to
+         * admit a parked producer) on success.  No per-op fence. */
+        for (int spin = 0; ; spin++) {
+            if (ring_spsc_pop(&ch->ring, out)) {
+                if (atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) != 0)
+                    chan_admit_senders_to_ring(ch);
+                return CHAN_OK;
+            }
+            /* ring empty */
+            if (atomic_load_explicit(&ch->closed, memory_order_acquire)) break;
+            if (spin >= LIBCHAN_FASTPATH_SPIN) break;
+            chan_spin_hint(spin & 7);
         }
-        /* ring was empty — fall through; check closed inside lock */
+        /* fall through to the locked slow path */
+    } else if (ch->capacity > 0) {
+        for (int spin = 0; ; spin++) {
+            if (atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) != 0) break;
+            if (atomic_load_explicit(&ch->recv_waiter_cnt, memory_order_relaxed) != 0) break;
+            if (ring_lf_pop(&ch->ring, out)) {
+                /* Wake a parked sender if one is present.  MPMC pairs a seq_cst
+                 * fence with the sender's seq_cst registration. */
+                atomic_thread_fence(memory_order_seq_cst);
+                if (atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) != 0)
+                    chan_admit_senders_to_ring(ch);
+                return CHAN_OK;
+            }
+            /* ring empty */
+            if (atomic_load_explicit(&ch->closed, memory_order_acquire)) break;
+            if (spin >= LIBCHAN_FASTPATH_SPIN) break;
+            chan_spin_hint(spin & 7);  /* 纯 pause,不 yield */
+        }
+        /* fall through to the locked slow path */
     }
 
     /* ---------- Slow path: acquire lock ---------- */
@@ -129,6 +155,40 @@ chan_err_t chan_recv_impl(chan_t *ch, void *out, int64_t timeout_ns) {
         return CHAN_OK;
     }
     chan_unlock(&ch->lock);
+
+    /* SPSC blocking recv: the single-producer fast path omits the per-op
+     * seq_cst fence, so a push that races our registration may not observe our
+     * recv_waiter_cnt store and thus skip waking us.  Park with a bounded
+     * backstop and recheck once; if the ring is still empty afterwards, our
+     * count has been durably visible long enough that ANY future push reliably
+     * sees it and wakes us, so we then park indefinitely.  One extra wakeup per
+     * park episode, no per-op cost on the producer, no reliance on chan_close.
+     * (See LIBCHAN_SPSC_PARK_BACKSTOP_NS.) */
+    if (ch->spsc && timeout_ns < 0) {
+        if (!chan_park_wait(self.wake_park, LIBCHAN_SPSC_PARK_BACKSTOP_NS)) {
+            chan_lock(&ch->lock);
+            if (waitq_remove(&ch->recv_waiters, &self)) {
+                /* Still queued — nobody delivered.  Grab a racing push that
+                 * failed to wake us; else re-queue and park indefinitely. */
+                if (ring_pop(ch, out)) {
+                    self.result = CHAN_OK;
+                    chan_unlock(&ch->lock);
+                } else if (atomic_load_explicit(&ch->closed, memory_order_relaxed)) {
+                    self.result = CHAN_ERR_CLOSED;
+                    chan_unlock(&ch->lock);
+                } else {
+                    waitq_push(&ch->recv_waiters, &self);
+                    chan_unlock(&ch->lock);
+                    chan_park_wait(self.wake_park, -1);
+                }
+            } else {
+                chan_unlock(&ch->lock);   /* delivered while we timed out */
+            }
+        }
+        atomic_fetch_sub_explicit(&ch->recv_waiter_cnt, 1, memory_order_relaxed);
+        waiter_destroy(&self);
+        return self.result;
+    }
 
     if (!chan_park_wait(self.wake_park, timeout_ns)) {
         chan_lock(&ch->lock);

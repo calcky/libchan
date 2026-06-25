@@ -17,6 +17,32 @@
 #define WAITER_WAITING  0
 #define WAITER_WOKEN    1
 
+/* Bounded lock-free retry count before chan_send/recv fall to the locked
+ * slow path and park.  Spinning here keeps the waiter counts at 0 during
+ * transient full/empty, so the opposite side stays on its fast path and a
+ * buffered pipeline can actually pipeline instead of parking per message. */
+#ifndef LIBCHAN_FASTPATH_SPIN
+#define LIBCHAN_FASTPATH_SPIN 64
+#endif
+
+/* SPSC blocking-park backstop (nanoseconds).
+ *
+ * The SPSC fast paths omit the per-op seq_cst fence the MPMC paths use, so a
+ * push/pop that races a parking waiter's count store may fail to wake it.  An
+ * infinite-wait SPSC park therefore parks with THIS bounded timeout and, on
+ * timeout, rechecks the ring once before parking indefinitely.  The recheck
+ * catches the rare missed wake (the window is sub-µs even on weak memory); once
+ * the ring is confirmed still empty/full, the waiter's count has been durably
+ * visible far longer than any propagation delay, so every future op reliably
+ * sees it and wakes the waiter — the indefinite re-park is then safe and adds
+ * no further timeouts.  Net effect: exactly one extra wakeup per park episode,
+ * then silence.  Keeps the producer/consumer hot path fence-free (surpassing
+ * the per-op-fence throughput) while staying deadlock-free in request/response
+ * patterns WITHOUT relying on chan_close. */
+#ifndef LIBCHAN_SPSC_PARK_BACKSTOP_NS
+#define LIBCHAN_SPSC_PARK_BACKSTOP_NS (1000000LL)   /* 1 ms */
+#endif
+
 /* ---- Park abstraction ---- */
 #if defined(LIBCHAN_USE_FUTEX)
 #  include <stdatomic.h>
@@ -111,6 +137,9 @@ static inline void chan_unlock(chan_mutex_t *m)         { pthread_mutex_unlock(m
 struct chan {
     size_t        elem_size;   /* immutable */
     size_t        capacity;    /* immutable; 0 = unbuffered (user-visible value) */
+    bool          spsc;        /* immutable; opt-in single-producer-single-consumer
+                                * fast path (cursor-cached ring ops). User contract:
+                                * at most one producer thread and one consumer thread. */
 
     chan_mutex_t  lock CHAN_ALIGNED;
 
@@ -141,6 +170,60 @@ static inline bool ring_empty(const struct chan *ch) {
     uint32_t pt = atomic_load_explicit(&ch->ring.prod.tail, memory_order_relaxed);
     uint32_t csh = atomic_load_explicit(&ch->ring.cons.head, memory_order_relaxed);
     return pt == csh;
+}
+
+/* Fast-path ring dispatch: SPSC channels use the cursor-cached variants
+ * (single-owner caches — safe only because the SPSC contract guarantees one
+ * producer + one consumer); all other channels use the MPMC-safe variants.
+ * The locked slow path and the lost-wakeup helpers always use the plain
+ * ring_push/ring_pop wrappers (never the cached variants), so the caches are
+ * only ever advanced by their owning side and at worst go stale-low.
+ *
+ * The SPSC variants are defined here as static inline (rather than out-of-line
+ * in ring_lf.c) so the compiler inlines them straight into chan_send/recv,
+ * removing the per-op cross-TU call overhead on the hot path. */
+static inline bool ring_spsc_push(chan_ring_lf_t *r, const void *data) {
+    /* Single producer ⇒ prod.head == prod.tail; it alone advances them. */
+    uint32_t ph = atomic_load_explicit(&r->prod.head, memory_order_relaxed);
+    /* Full check against the private cache (a lower bound on cons.tail); only
+     * read the real hot cons.tail when the cache says we might be full. */
+    if ((uint32_t)(ph - r->prod.cached_cons_tail) >= r->capacity) {
+        r->prod.cached_cons_tail =
+            atomic_load_explicit(&r->cons.tail, memory_order_acquire);
+        if ((uint32_t)(ph - r->prod.cached_cons_tail) >= r->capacity)
+            return false;   /* full */
+    }
+    memcpy(r->slots + (ph & r->mask) * r->elem_size, data, r->elem_size);
+    atomic_store_explicit(&r->prod.tail, ph + 1, memory_order_release);
+    atomic_store_explicit(&r->prod.head, ph + 1, memory_order_relaxed);
+    return true;
+}
+static inline bool ring_spsc_pop(chan_ring_lf_t *r, void *out) {
+    /* Single consumer ⇒ cons.head == cons.tail; it alone advances them. */
+    uint32_t ch = atomic_load_explicit(&r->cons.head, memory_order_relaxed);
+    /* Item at ch exists iff ch is strictly before prod.tail (modular).  The
+     * cache is a lower bound; reload the real prod.tail when ch is not proven
+     * before it (ch >= cache, incl. when a slow-path pop advanced past a stale
+     * cache).  `== cache` would be a bug — it misses ch > cache. */
+    if ((int32_t)(ch - r->cons.cached_prod_tail) >= 0) {
+        r->cons.cached_prod_tail =
+            atomic_load_explicit(&r->prod.tail, memory_order_acquire);
+        if ((int32_t)(ch - r->cons.cached_prod_tail) >= 0)
+            return false;   /* empty */
+    }
+    memcpy(out, r->slots + (ch & r->mask) * r->elem_size, r->elem_size);
+    atomic_store_explicit(&r->cons.tail, ch + 1, memory_order_release);
+    atomic_store_explicit(&r->cons.head, ch + 1, memory_order_relaxed);
+    return true;
+}
+
+static inline bool ring_lf_push_dispatch(struct chan *ch, const void *data) {
+    return ch->spsc ? ring_spsc_push(&ch->ring, data)
+                    : ring_lf_push(&ch->ring, data);
+}
+static inline bool ring_lf_pop_dispatch(struct chan *ch, void *out) {
+    return ch->spsc ? ring_spsc_pop(&ch->ring, out)
+                    : ring_lf_pop(&ch->ring, out);
 }
 
 /* ---- Waiter helpers ---- */

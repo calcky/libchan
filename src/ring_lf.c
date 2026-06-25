@@ -20,6 +20,8 @@ bool ring_lf_init(chan_ring_lf_t *r, size_t cap, size_t elem_size) {
     atomic_init(&r->prod.tail, 0);
     atomic_init(&r->cons.head, 0);
     atomic_init(&r->cons.tail, 0);
+    r->prod.cached_cons_tail = 0;
+    r->cons.cached_prod_tail = 0;
     r->mask      = actual - 1;
     r->capacity  = actual;
     r->elem_size = elem_size;

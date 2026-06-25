@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-chan_t *chan_create(size_t elem_size, size_t capacity) {
+static chan_t *chan_create_impl(size_t elem_size, size_t capacity, bool spsc) {
     if (elem_size == 0) return NULL;
 
     chan_t *ch = calloc(1, sizeof(*ch));
@@ -11,6 +11,7 @@ chan_t *chan_create(size_t elem_size, size_t capacity) {
 
     ch->elem_size = elem_size;
     ch->capacity  = capacity;
+    ch->spsc      = spsc && capacity > 0;   /* caching only applies to buffered rings */
 
     if (capacity > 0) {
         if (!ring_lf_init(&ch->ring, capacity, elem_size)) {
@@ -31,6 +32,14 @@ chan_t *chan_create(size_t elem_size, size_t capacity) {
     ch->recv_waiters.tail = NULL;
 
     return ch;
+}
+
+chan_t *chan_create(size_t elem_size, size_t capacity) {
+    return chan_create_impl(elem_size, capacity, false);
+}
+
+chan_t *chan_create_spsc(size_t elem_size, size_t capacity) {
+    return chan_create_impl(elem_size, capacity, true);
 }
 
 static void chan_free(chan_t *ch) {

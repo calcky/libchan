@@ -34,12 +34,14 @@ typedef struct {
     struct {
         _Atomic uint32_t head;   /* reserved-up-to by producers */
         _Atomic uint32_t tail;   /* committed-up-to by producers (visible to consumers) */
+        uint32_t cached_cons_tail; /* SPSC-only: producer-private cache of cons.tail */
     } prod RING_LF_ALIGNED;
 
     /* Consumer cursors — separate cache line */
     struct {
         _Atomic uint32_t head;   /* reserved-up-to by consumers */
         _Atomic uint32_t tail;   /* committed-up-to by consumers (visible to producers) */
+        uint32_t cached_prod_tail; /* SPSC-only: consumer-private cache of prod.tail */
     } cons RING_LF_ALIGNED;
 
     uint32_t  mask;       /* capacity - 1; index via [idx & mask] */
@@ -55,6 +57,20 @@ void ring_lf_destroy(chan_ring_lf_t *r);
 /* Returns true on success; false if full (push) or empty (pop). */
 bool ring_lf_push(chan_ring_lf_t *r, const void *data);
 bool ring_lf_pop (chan_ring_lf_t *r, void *out);
+
+/* SPSC-only cursor-cached fast variants are defined as static inline in
+ * libchan_internal.h (ring_spsc_push / ring_spsc_pop) so they inline into
+ * chan_send/recv.  SAFETY CONTRACT — correct only with exactly ONE producer
+ * thread and ONE consumer thread:
+ *   - prod.cached_cons_tail is read/written ONLY by the single producer;
+ *   - cons.cached_prod_tail is read/written ONLY by the single consumer;
+ *   - each cache only ever holds a value that that side itself acquire-loaded
+ *     from the real opposite cursor, so the slot-data happens-before is
+ *     preserved (single-owner ⇒ the transitive-visibility hole that makes
+ *     cursor caching unsafe under MPMC cannot occur).
+ * The plain ring_lf_push/pop (with CAS + Phase-3) remain MPMC-safe and are
+ * still used by the locked slow path and the lost-wakeup helpers; those never
+ * touch the cache fields, so a cache merely goes stale-low (always safe). */
 
 /* Approximate count of committed items not yet reserved by consumers. */
 uint32_t ring_lf_count(const chan_ring_lf_t *r);
