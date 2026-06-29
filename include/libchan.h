@@ -83,6 +83,29 @@ LIBCHAN_API chan_err_t chan_recv(chan_t *ch, void *out);
 LIBCHAN_API chan_err_t chan_try_recv(chan_t *ch, void *out);
 LIBCHAN_API chan_err_t chan_recv_timeout(chan_t *ch, void *out, int64_t timeout_ns);
 
+/* ---- Burst (bulk) — non-blocking, buffered channels only ----
+ *
+ * Move up to `n` contiguous elements (each of elem_size bytes) in ONE batch:
+ * `data`/`out` point to an array of n elements.  These reserve a run of slots
+ * with a single CAS and one commit, amortising the per-op cross-core cost over
+ * the batch (see ring_lf.h / doc/benchmarks.md §0.5).
+ *
+ * Semantics — best-effort, never block, never park:
+ *   - return the number of elements actually moved (0..n);
+ *   - chan_try_send_burst returns < n (possibly 0) when the ring fills, and 0
+ *     if the channel is closed or unbuffered (capacity == 0);
+ *   - chan_try_recv_burst returns < n (possibly 0) when the ring drains, and 0
+ *     on an unbuffered channel.  Like chan_recv it keeps draining buffered items
+ *     after close (Go semantics); 0 once empty.
+ *
+ * MPMC-safe and usable on any channel (including chan_create_spsc); a successful
+ * burst wakes a parked single-element peer exactly as the single-element fast
+ * path does, so bursts may be freely mixed with blocking chan_send/chan_recv.
+ * Not strictly FIFO-fair toward already-parked senders (a burst may fill the
+ * ring ahead of them); they are admitted by the next receiver. */
+LIBCHAN_API size_t chan_try_send_burst(chan_t *ch, const void *data, size_t n);
+LIBCHAN_API size_t chan_try_recv_burst(chan_t *ch, void *out, size_t n);
+
 /* ---- Introspection ---- */
 
 LIBCHAN_API size_t chan_len(const chan_t *ch);   /* elements currently buffered */

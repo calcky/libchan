@@ -118,6 +118,13 @@ enqueue + dequeue):
 > - Safety is unchanged: the bulk path runs the same reserve→write→commit three-phase protocol and
 >   memory ordering (passes TSan), remains MPMC-safe, and never touches the SPSC cache fields.
 
+The same amortization is exposed through the **public** burst API (`chan_try_send_burst` /
+`chan_try_recv_burst`). It shows up in the showcase ladder as row **`6b. chan MPMC burst=32
+cross-core steady-state`** and is tracked on the live `gh-pages` trend dashboard alongside the
+single-element rows — on this dev machine batch=32 lifts the MPMC cross-core steady-state from
+~6 Mops (#5) to **~180 Mops** through the full channel (not just the raw ring), confirming the
+wall is per-CAS/per-commit, not per-element.
+
 ---
 
 ## 1. Park backend comparison: futex vs pthread

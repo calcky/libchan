@@ -208,3 +208,20 @@ chan_err_t chan_recv_impl(chan_t *ch, void *out, int64_t timeout_ns) {
 chan_err_t chan_recv(chan_t *ch, void *out)                        { return chan_recv_impl(ch, out, -1); }
 chan_err_t chan_try_recv(chan_t *ch, void *out)                    { return chan_recv_impl(ch, out,  0); }
 chan_err_t chan_recv_timeout(chan_t *ch, void *out, int64_t ns)    { return chan_recv_impl(ch, out, ns); }
+
+size_t chan_try_recv_burst(chan_t *ch, void *out, size_t n) {
+    if (!ch || !out || n == 0) return 0;
+    if (ch->capacity == 0) return 0;   /* unbuffered: no ring to drain */
+
+    /* ring_lf_dequeue_burst acquire-loads prod.tail, so it sees data published
+     * by a concurrent sender; like chan_recv it keeps draining after close. */
+    uint32_t want = n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+    uint32_t got  = ring_lf_dequeue_burst(&ch->ring, out, want);
+    if (got == 0) return 0;
+
+    /* Admit parked senders — mirrors the single-element fast path's wake. */
+    if (!ch->spsc) atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&ch->send_waiter_cnt, memory_order_relaxed) != 0)
+        chan_admit_senders_to_ring(ch);
+    return got;
+}

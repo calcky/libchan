@@ -200,3 +200,22 @@ chan_err_t chan_send_impl(chan_t *ch, const void *data, int64_t timeout_ns) {
 chan_err_t chan_send(chan_t *ch, const void *data)                        { return chan_send_impl(ch, data, -1); }
 chan_err_t chan_try_send(chan_t *ch, const void *data)                    { return chan_send_impl(ch, data,  0); }
 chan_err_t chan_send_timeout(chan_t *ch, const void *data, int64_t ns)    { return chan_send_impl(ch, data, ns); }
+
+size_t chan_try_send_burst(chan_t *ch, const void *data, size_t n) {
+    if (!ch || !data || n == 0) return 0;
+    if (ch->capacity == 0) return 0;   /* unbuffered: no ring to batch into */
+    if (atomic_load_explicit(&ch->closed, memory_order_acquire)) return 0;
+
+    uint32_t want = n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+    uint32_t got  = ring_lf_enqueue_burst(&ch->ring, data, want);
+    if (got == 0) return 0;
+
+    /* Wake parked receivers — identical protocol to the single-element fast
+     * path: MPMC pairs a seq_cst fence with the receiver's seq_cst registration
+     * so a concurrently-parking receiver is never missed; SPSC omits the fence
+     * (the park-side backstop recovers the rare missed wake). */
+    if (!ch->spsc) atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&ch->recv_waiter_cnt, memory_order_relaxed) != 0)
+        chan_deliver_ring_to_receivers(ch);
+    return got;
+}

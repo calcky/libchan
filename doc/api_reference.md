@@ -256,6 +256,41 @@ A receive with a timeout; `timeout_ns` has the same semantics as `chan_send_time
 
 ---
 
+## Burst (bulk transfer)
+
+Non-blocking batch operations that move up to `n` contiguous elements in **one** reservation, amortizing the per-operation cross-core atomic cost over the whole batch. They apply to **buffered channels only** and never block or park.
+
+`data` / `out` point to an array of `n` elements, each of the `elem_size` given to `chan_create`.
+
+### `chan_try_send_burst`
+
+```c
+size_t chan_try_send_burst(chan_t *ch, const void *data, size_t n);
+```
+
+Enqueues as many of the `n` elements as currently fit, in order.
+
+**Return value**: the number of elements actually enqueued (`0..n`). Returns `0` when the ring is full, when the channel is closed, or when the channel is unbuffered (`capacity == 0`).
+
+### `chan_try_recv_burst`
+
+```c
+size_t chan_try_recv_burst(chan_t *ch, void *out, size_t n);
+```
+
+Dequeues up to `n` buffered elements, oldest first, into `out`.
+
+**Return value**: the number of elements actually received (`0..n`). Returns `0` when the ring is empty or the channel is unbuffered. Like `chan_recv`, it keeps draining buffered items after `chan_close`, returning `0` only once the buffer is empty.
+
+**Notes**
+
+- MPMC-safe and usable on any channel, including one created with `chan_create_spsc`.
+- A successful burst wakes a parked single-element peer exactly as the single-element fast path does, so bursts may be freely mixed with blocking `chan_send` / `chan_recv` without losing wakeups.
+- Not strictly FIFO-fair toward already-parked senders (a burst may fill the ring ahead of them); such senders are admitted by the next receiver.
+- Performance: see `bench/bench_showcase` row `6b` and [`benchmarks.md`](benchmarks.md) §0.5 — batching lifts MPMC cross-core throughput far past the single-element "cache-coherence wall".
+
+---
+
 ## Introspection
 
 ### `chan_len`
@@ -334,7 +369,7 @@ Returns a static string corresponding to the error code, for use in logging and 
 |-------------------|-------------|
 | `chan_create` | Yes (creates an independent object) |
 | `chan_destroy` / `chan_retain` | Yes (atomic reference counting) |
-| `chan_send*` / `chan_recv*` | Yes (protected by an internal mutex) |
+| `chan_send*` / `chan_recv*` / `chan_try_*_burst` | Yes (protected by an internal mutex; bursts use the lock-free ring + slow-path wake) |
 | `chan_close` | Yes (atomic + mutex, idempotent) |
 | `chan_is_closed` | Yes (atomic read, weak consistency) |
 | `chan_len` / `chan_cap` | Yes (`len` takes the lock, `cap` needs no lock) |

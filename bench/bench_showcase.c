@@ -181,6 +181,56 @@ static double bench_chan_steady(void *ctx) {
     return (double)dt / SS_MSGS;
 }
 
+/* chan burst steady-state: 1 producer + 1 consumer drive the PUBLIC burst API
+ * (chan_try_send_burst / chan_try_recv_burst, batch BURST_BATCH).  Same MPMC
+ * channel and busy-poll method as #5, but each cross-core CAS + commit carries a
+ * whole batch, so the per-element cost falls ~1/batch — bulk amortizes the
+ * cache-coherence wall (cf. bench_bulk / doc/benchmarks.md §0.5).
+ * One "op" = one element through send_burst + recv_burst. */
+#define BURST_BATCH 32
+#define BURST_CAP   4096
+#define BURST_MSGS  8000000L
+
+typedef struct { chan_t *ch; _Atomic int done; } burst_ctx_t;
+
+static void *burst_consumer_ss(void *arg) {
+    burst_ctx_t *s = arg;
+    int buf[BURST_BATCH];
+    for (;;) {
+        if (chan_try_recv_burst(s->ch, buf, BURST_BATCH)) continue;   /* drained some */
+        if (atomic_load_explicit(&s->done, memory_order_acquire)) {
+            if (chan_try_recv_burst(s->ch, buf, BURST_BATCH)) continue;
+            break;
+        }
+        __asm__ volatile("" ::: "memory");                            /* spin */
+    }
+    return NULL;
+}
+
+static double bench_chan_burst(void *ctx) {
+    (void)ctx;
+    chan_t *ch = chan_create(sizeof(int), BURST_CAP);   /* MPMC ring, burst is MPMC-safe */
+    burst_ctx_t s = { ch, 0 };
+    pthread_t c;
+    pthread_create(&c, NULL, burst_consumer_ss, &s);
+
+    int buf[BURST_BATCH];
+    for (int i = 0; i < BURST_BATCH; i++) buf[i] = i;
+    long sent = 0;
+    int64_t t0 = now_ns();
+    while (sent < BURST_MSGS) {
+        size_t k = chan_try_send_burst(ch, buf, BURST_BATCH);
+        if (k) sent += (long)k;                          /* full → spin, no park */
+        else __asm__ volatile("" ::: "memory");
+    }
+    int64_t dt = now_ns() - t0;
+
+    atomic_store_explicit(&s.done, 1, memory_order_release);
+    pthread_join(c, NULL);
+    chan_destroy(ch);
+    return (double)dt / sent;   /* ns per element */
+}
+
 /* ── Tier B: blocking path (includes park + OS scheduling) ──────────────── */
 
 #define B_MSGS 2000000L
@@ -244,6 +294,7 @@ int main(void) {
     bool steady_mpmc = false, steady_spsc = true;
     run_point("5. chan MPMC cross-core steady-state (cache-coherence wall)", bench_chan_steady, &steady_mpmc);
     run_point("6. chan SPSC cross-core steady-state (cursor caching breaks the wall)", bench_chan_steady, &steady_spsc);
+    run_point("6b. chan MPMC burst=32 cross-core steady-state (bulk amortizes the wall)", bench_chan_burst, NULL);
 
     printf("\n=== Tier B · blocking latency (includes park + OS scheduling, trend-only reference) ===\n");
     printf("%-38s  %9s  %9s  %9s\n", "scenario", "med ns", "min ns", "Mops/s");

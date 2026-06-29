@@ -37,3 +37,6 @@ set_tests_properties(test_nm_stress PROPERTIES TIMEOUT 300)
 # src/ include path for ring_lf.h.
 add_chan_test(test_bulk)
 target_include_directories(test_bulk PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# test_burst drives the public chan_try_send_burst/recv_burst API (no src/ needed).
+add_chan_test(test_burst)
