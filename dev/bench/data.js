@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782701880847,
+  "lastUpdate": 1782729483845,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -472,6 +472,63 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.4,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "c6b2495fa6d00d1aa4b4d5e7f6e92aa227223a28",
+          "message": "feat(examples): add dplane_pipeline SPSC data-plane simulation\n\nProvide a multi-path pipeline demo with CLI traffic control, per-path\nsequence verification, latency percentiles, and configurable node poll\nmodes (spin/yield/backoff/block) for throughput vs CPU tradeoffs.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-06-29T18:36:35+08:00",
+          "tree_id": "2bed6719ea334c067c8772a07b857c03891dbe84",
+          "url": "https://github.com/calcky/libchan/commit/c6b2495fa6d00d1aa4b4d5e7f6e92aa227223a28"
+        },
+        "date": 1782729482897,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 49.41,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 5.69,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 26.58,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6b. chan MPMC burst=32 cross-core steady-state (bulk amortizes the wall)",
+            "value": 182.12,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 37.47,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.48,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.57,
             "unit": "Mops/s"
           }
         ]
