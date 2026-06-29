@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782372366952,
+  "lastUpdate": 1782701880847,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -415,6 +415,63 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.39,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "1012d00b75d4ac7de2eef8385bd65ce761703b06",
+          "message": "feat(api): public non-blocking burst send/recv to amortize the cross-core wall\n\nExpose chan_try_send_burst / chan_try_recv_burst over the existing MPMC ring\nbulk path: move up to n contiguous elements per reservation so the per-op CAS +\nPhase-3 commit cross-core cost is amortized over the batch. Buffered-only,\nbest-effort (return the count moved), MPMC-safe and usable on SPSC channels.\n\nA successful burst wakes a parked single-element peer with the same seq_cst-fence\n+ slow-path delivery protocol as the single-element fast path, so bursts mix\nsafely with blocking chan_send/chan_recv (no lost wakeups).\n\nAdds test_burst (FIFO/clamp/closed-drain, single-op interop, MPMC exactly-once,\nand blocking-receiver wake) — passes ctest + TSan — and a showcase ladder row\n\"6b. chan MPMC burst=32\" that the trend pipeline tracks on gh-pages (~6 -> ~180\nMops/s vs the single-element MPMC steady-state on the dev machine).\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-06-29T10:57:06+08:00",
+          "tree_id": "73f41f08ba3719850a14647dd90882ae8819a58e",
+          "url": "https://github.com/calcky/libchan/commit/1012d00b75d4ac7de2eef8385bd65ce761703b06"
+        },
+        "date": 1782701880597,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 49.37,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 6.1,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 18.19,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6b. chan MPMC burst=32 cross-core steady-state (bulk amortizes the wall)",
+            "value": 186.59,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 39.09,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.51,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 1.4,
             "unit": "Mops/s"
           }
         ]
