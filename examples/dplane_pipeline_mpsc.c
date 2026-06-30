@@ -1,63 +1,21 @@
 /*
- * dplane_pipeline.c — Simulated data-plane pipeline (SPSC channels)
+ * dplane_pipeline_mpsc.c — Simulated data-plane pipeline (per-node MPSC inboxes)
  *
- * Nodes (one dedicated thread each, one producer + one consumer per link):
- *   tun      ingress / host side
- *   forward  hub — polls tun / tunnel / oam (+ enc return) via chan_try_recv
- *   enc      encrypt / encode stage
- *   tunnel   tunnel egress / peer side
- *   oam      operations, administration & maintenance
+ * Each node thread owns one chan_create inbox (MPMC ring, single consumer).
+ * Other threads send packets to that inbox.  Same 6 paths and CLI as
+ * dplane_pipeline.c (SPSC per-link version).
  *
- * Physical topology (10 SPSC links; each paired label is one channel both ways):
- *
- *                        +-------+
- *                        |  enc  |
- *                        +---+---+
- *                       /       \
- *           enc_to_tunnel       tunnel_to_enc
- *                     /           \
- *  +-------+    +----+----+    +---------+
- *  |  tun  |<-->| forward |<-->| tunnel  |
- *  +-------+    +----+----+    +---------+
- * tun_to_forward    |      forward_to_tunnel
- * forward_to_tun    |      tunnel_to_forward
- *                   |
- *      forward_to_oam | oam_to_forward
- *                   v
- *               +-------+
- *               |  oam  |
- *               +-------+
- *
- * Pipelines on this graph (self-test):
- *
- *   [1]  tun ------> forward ------> enc ------> tunnel     (symmetric [2])
- *   [2]  tunnel --> enc ------> forward ------> tun
- *   [3]  tunnel --> forward ------> tun                     (symmetric [4])
- *   [4]  tun ------> forward ------> tunnel
- *   [5]  tunnel --> forward ------> oam                     (symmetric [6])
- *   [6]  oam ------> forward ------> tunnel
- *
- * CLI:
- *   -l 1,3,6     paths to run (1-based, default all)
- *   -c N          packets per enabled path (default 1); mutually exclusive with -t
- *   -t SEC        run for SEC seconds, keep injecting (default off)
- *   -i USEC       microseconds between injections (default 0)
- *   -P            parallel inject when -l selects multiple paths (default: sequential)
- *   -m MODE       poll mode: spin | yield | backoff | block[:USEC] (default: spin)
- *
- * Verification (per path, independent sequence numbers starting at 0):
- *   each packet carries (path, seq).  The receiver checks:
- *     - seq == next_expected  → in-order, OK
- *     - seq <  next_expected  → duplicate (reordered retry or double delivery)
- *     - seq >  next_expected  → gap: (seq - next_expected) packets lost upstream
- *   At drain: sent must equal recv_unique; lost and dup must be 0.
- *   SPSC FIFO per link preserves order within a path when there is no loss.
- *   Latency: inject → done (monotonic clock), reported as avg / p50 / p90 / p99.
+ * Inboxes (consumer → producers):
+ *   in_tun      tun      ← main, forward
+ *   in_forward  forward  ← tun, tunnel, oam, enc
+ *   in_enc      enc      ← forward, tunnel
+ *   in_tunnel   tunnel   ← main, forward, enc
+ *   in_oam      oam      ← main, forward
+ *   in_done     main     ← tun, tunnel, oam (sink completions)
  *
  * Build & run:
- *   cmake -B build -DLIBCHAN_BUILD_EXAMPLES=ON && cmake --build build --target dplane_pipeline
- *   ./build/examples/dplane_pipeline -l 1,4 -c 10000 -i 0
- *   ./build/examples/dplane_pipeline -t 5 -i 100
+ *   cmake --build build --target dplane_pipeline_mpsc
+ *   ./build/examples/dplane_pipeline_mpsc -l 1 -c 10000 -m spin
  */
 
 #include <stdio.h>
@@ -73,16 +31,17 @@
 #include "libchan.h"
 
 #define CHAN_CAP              4096
+#define CHAN_CAP_HOT          (CHAN_CAP * 2)
 #define DRAIN_SEC             30
 #define BLOCK_WAIT_USEC_DEFAULT 100
 
 typedef enum {
-    PATH_TUN_FORWARD_ENC_TUNNEL,   /* [1] */
-    PATH_TUNNEL_ENC_FORWARD_TUN,   /* [2] */
-    PATH_TUNNEL_FORWARD_TUN,       /* [3] */
-    PATH_TUN_FORWARD_TUNNEL,       /* [4] */
-    PATH_TUNNEL_FORWARD_OAM,       /* [5] */
-    PATH_OAM_FORWARD_TUNNEL,       /* [6] */
+    PATH_TUN_FORWARD_ENC_TUNNEL,
+    PATH_TUNNEL_ENC_FORWARD_TUN,
+    PATH_TUNNEL_FORWARD_TUN,
+    PATH_TUN_FORWARD_TUNNEL,
+    PATH_TUNNEL_FORWARD_OAM,
+    PATH_OAM_FORWARD_TUNNEL,
     PATH_COUNT
 } path_id_t;
 
@@ -94,69 +53,55 @@ typedef struct {
 typedef struct {
     path_id_t path;
     uint32_t  seq;
-    int64_t   done_ns;  /* completion time at sink node */
+    int64_t   done_ns;
 } done_msg_t;
 
 typedef struct {
-    chan_t *tun_to_forward;
-    chan_t *forward_to_enc;
-    chan_t *enc_to_tunnel;
-    chan_t *tunnel_to_enc;
-    chan_t *enc_to_forward;
-    chan_t *forward_to_tun;
-    chan_t *tunnel_to_forward;
-    chan_t *forward_to_oam;
-    chan_t *oam_to_forward;
-    chan_t *forward_to_tunnel;
-} links_t;
-
-typedef struct {
-    chan_t *inj_tun;
-    chan_t *inj_tunnel;
-    chan_t *inj_oam;
-    chan_t *done_tun;
-    chan_t *done_tunnel;
-    chan_t *done_oam;
-} test_io_t;
+    chan_t *in_tun;
+    chan_t *in_forward;
+    chan_t *in_enc;
+    chan_t *in_tunnel;
+    chan_t *in_oam;
+    chan_t *in_done;
+} inboxes_t;
 
 typedef enum {
-    POLL_SPIN,     /* tight chan_try_recv, 100% CPU when idle, lowest latency */
-    POLL_YIELD,    /* sched_yield when idle */
-    POLL_BACKOFF,  /* PAUSE/yield → 100 us sleep escalation */
-    POLL_BLOCK,    /* chan_select park until data (saves CPU) */
+    POLL_SPIN,
+    POLL_YIELD,
+    POLL_BACKOFF,
+    POLL_BLOCK,
 } poll_mode_t;
 
 typedef struct {
-    links_t   link;
-    test_io_t io;
+    inboxes_t   box;
     poll_mode_t mode;
-    uint32_t    block_wait_usec; /* block mode: sleep when all inputs empty */
+    uint32_t    block_wait_usec;
     volatile bool stop;
 } plane_t;
 
 typedef struct {
     bool     enabled;
     uint64_t sent;
-    uint64_t recv;          /* accepted deliveries (excl. duplicates) */
-    uint64_t dup;           /* seq < next_expected */
-    uint64_t lost;          /* gaps: seq > next_expected */
-    uint32_t next_expected; /* next in-order seq for this path */
+    uint64_t recv;
+    uint64_t dup;
+    uint64_t lost;
+    uint32_t next_expected;
 } path_stat_t;
 
 typedef struct {
     bool        path_enabled[PATH_COUNT];
-    uint64_t    count;          /* -c: packets per path */
-    double      duration_sec;   /* -t: 0 = use count mode */
-    uint32_t    interval_usec;  /* -i */
-    bool        parallel;       /* -P: round-robin when multiple paths */
-    poll_mode_t poll_mode;      /* -m */
+    uint64_t    count;
+    double      duration_sec;
+    uint32_t    interval_usec;
+    bool        parallel;
+    poll_mode_t poll_mode;
     uint32_t    block_wait_usec;
 } run_config_t;
 
 typedef struct {
-    int64_t  *send_ts;   /* send_ts[seq] = inject time (ns) */
+    int64_t  *send_ts;
     uint64_t  send_cap;
-    uint64_t *samples;   /* end-to-end latency per accepted packet (ns) */
+    uint64_t *samples;
     uint64_t  n;
     uint64_t  cap;
     uint64_t  sum;
@@ -173,8 +118,6 @@ static int64_t now_ns(void) {
 }
 
 static void poll_idle(const plane_t *pl, int *idle_spins);
-static bool ports_have_backlog(chan_t **ports, int n);
-static void node_idle(const plane_t *pl, chan_t **ports, int n, int *idle);
 
 static void sleep_usec(uint32_t usec) {
     if (usec == 0) return;
@@ -205,9 +148,23 @@ static const char *path_name(path_id_t path) {
     return names[path];
 }
 
-static bool spsc_send(chan_t *ch, const void *pkt) {
+static bool mpsc_send(chan_t *ch, const void *pkt) {
     return chan_send(ch, pkt) == CHAN_OK;
 }
+
+static void node_idle_one(const plane_t *pl, chan_t *inbox, int *idle) {
+    if (pl->mode == POLL_BLOCK && inbox && chan_len(inbox) > 0) {
+        spin_pause();
+        return;
+    }
+    poll_idle(pl, idle);
+}
+
+static bool inbox_done(const plane_t *pl, chan_t *inbox) {
+    return chan_is_closed(inbox);
+}
+
+/* ---- latency & stats (same as SPSC version) ------------------------- */
 
 static int lat_cmp(const void *a, const void *b) {
     uint64_t va = *(const uint64_t *)a;
@@ -338,7 +295,6 @@ static void print_latency_us(const char *label, const latency_summary_t *s) {
            (double)s->p90 / 1000.0, (double)s->p99 / 1000.0);
 }
 
-/* Record one completion; update per-path loss/dup/ordering stats. */
 static void stat_on_recv(path_stat_t *stat, path_id_t path, uint32_t seq,
                          int64_t done_ns, latency_ctx_t *lat) {
     if (!stat->enabled) return;
@@ -360,20 +316,10 @@ static void stat_on_recv(path_stat_t *stat, path_id_t path, uint32_t seq,
 
 static bool poll_done_try(plane_t *pl, path_stat_t *stats, latency_ctx_t *lat) {
     done_msg_t done;
-    bool got = false;
-    if (chan_try_recv(pl->io.done_tun, &done) == CHAN_OK) {
-        stat_on_recv(&stats[done.path], done.path, done.seq, done.done_ns, lat);
-        got = true;
-    }
-    if (chan_try_recv(pl->io.done_tunnel, &done) == CHAN_OK) {
-        stat_on_recv(&stats[done.path], done.path, done.seq, done.done_ns, lat);
-        got = true;
-    }
-    if (chan_try_recv(pl->io.done_oam, &done) == CHAN_OK) {
-        stat_on_recv(&stats[done.path], done.path, done.seq, done.done_ns, lat);
-        got = true;
-    }
-    return got;
+    if (chan_try_recv(pl->box.in_done, &done) != CHAN_OK)
+        return false;
+    stat_on_recv(&stats[done.path], done.path, done.seq, done.done_ns, lat);
+    return true;
 }
 
 static bool poll_done_wait(plane_t *pl, path_stat_t *stats, latency_ctx_t *lat,
@@ -419,7 +365,7 @@ static int enabled_path_count(const path_stat_t *stats) {
     return n;
 }
 
-/* ---- poll mode helpers ---------------------------------------------- */
+/* ---- poll modes ----------------------------------------------------- */
 
 static const char *poll_mode_name(poll_mode_t mode) {
     switch (mode) {
@@ -497,78 +443,28 @@ static void poll_idle(const plane_t *pl, int *idle_spins) {
     }
 }
 
-/* If any port already has buffered data, keep spinning (avoid sleeping). */
-static bool ports_have_backlog(chan_t **ports, int n) {
-    for (int i = 0; i < n; i++) {
-        if (chan_len(ports[i]) > 0) return true;
-    }
-    return false;
-}
+/* ---- routing -------------------------------------------------------- */
 
-static void node_idle(const plane_t *pl, chan_t **ports, int n, int *idle) {
-    if (pl->mode == POLL_BLOCK && ports && ports_have_backlog(ports, n)) {
-        spin_pause();
-        return;
-    }
-    poll_idle(pl, idle);
-}
-
-static void handle_tun_inj(plane_t *pl, const pkt_t *pkt) {
-    spsc_send(pl->link.tun_to_forward, pkt);
-}
-
-static void handle_tun_return(plane_t *pl, const pkt_t *pkt) {
+static void send_done(plane_t *pl, const pkt_t *pkt) {
     done_msg_t done = { pkt->path, pkt->seq, now_ns() };
-    spsc_send(pl->io.done_tun, &done);
-}
-
-static bool tun_closed(const plane_t *pl) {
-    return chan_is_closed(pl->io.inj_tun) && chan_is_closed(pl->link.forward_to_tun);
-}
-
-static void *tun_node(void *arg) {
-    plane_t *pl = arg;
-    pkt_t pkt;
-    int idle = 0;
-    chan_t *ports[2];
-
-    ports[0] = pl->io.inj_tun;
-    ports[1] = pl->link.forward_to_tun;
-
-    while (!pl->stop) {
-        bool work = false;
-        if (chan_try_recv(pl->io.inj_tun, &pkt) == CHAN_OK) {
-            handle_tun_inj(pl, &pkt);
-            work = true;
-        } else if (chan_try_recv(pl->link.forward_to_tun, &pkt) == CHAN_OK) {
-            handle_tun_return(pl, &pkt);
-            work = true;
-        }
-        if (work) {
-            idle = 0;
-            continue;
-        }
-        if (tun_closed(pl)) break;
-        node_idle(pl, ports, 2, &idle);
-    }
-    return NULL;
+    mpsc_send(pl->box.in_done, &done);
 }
 
 static void forward_route(plane_t *pl, const pkt_t *pkt) {
     switch (pkt->path) {
     case PATH_TUN_FORWARD_ENC_TUNNEL:
-        spsc_send(pl->link.forward_to_enc, pkt);
+        mpsc_send(pl->box.in_enc, pkt);
         break;
     case PATH_TUN_FORWARD_TUNNEL:
     case PATH_OAM_FORWARD_TUNNEL:
-        spsc_send(pl->link.forward_to_tunnel, pkt);
+        mpsc_send(pl->box.in_tunnel, pkt);
         break;
     case PATH_TUNNEL_ENC_FORWARD_TUN:
     case PATH_TUNNEL_FORWARD_TUN:
-        spsc_send(pl->link.forward_to_tun, pkt);
+        mpsc_send(pl->box.in_tun, pkt);
         break;
     case PATH_TUNNEL_FORWARD_OAM:
-        spsc_send(pl->link.forward_to_oam, pkt);
+        mpsc_send(pl->box.in_oam, pkt);
         break;
     default:
         fprintf(stderr, "forward: unknown path %d\n", (int)pkt->path);
@@ -576,256 +472,179 @@ static void forward_route(plane_t *pl, const pkt_t *pkt) {
     }
 }
 
-static bool forward_closed(const plane_t *pl) {
-    return chan_is_closed(pl->link.tun_to_forward) &&
-           chan_is_closed(pl->link.tunnel_to_forward) &&
-           chan_is_closed(pl->link.oam_to_forward) &&
-           chan_is_closed(pl->link.enc_to_forward);
+static void handle_enc_pkt(plane_t *pl, const pkt_t *pkt) {
+    if (pkt->path == PATH_TUN_FORWARD_ENC_TUNNEL)
+        mpsc_send(pl->box.in_tunnel, pkt);
+    else if (pkt->path == PATH_TUNNEL_ENC_FORWARD_TUN)
+        mpsc_send(pl->box.in_forward, pkt);
 }
 
-static bool forward_try_recv(plane_t *pl, pkt_t *pkt) {
-    if (chan_try_recv(pl->link.tun_to_forward, pkt) == CHAN_OK ||
-        chan_try_recv(pl->link.tunnel_to_forward, pkt) == CHAN_OK ||
-        chan_try_recv(pl->link.oam_to_forward, pkt) == CHAN_OK ||
-        chan_try_recv(pl->link.enc_to_forward, pkt) == CHAN_OK) {
-        forward_route(pl, pkt);
-        return true;
+static void tunnel_outbound(plane_t *pl, const pkt_t *pkt) {
+    if (pkt->path == PATH_TUNNEL_ENC_FORWARD_TUN)
+        mpsc_send(pl->box.in_enc, pkt);
+    else
+        mpsc_send(pl->box.in_forward, pkt);
+}
+
+static bool tun_pkt_forward(const pkt_t *pkt) {
+    return pkt->path == PATH_TUN_FORWARD_ENC_TUNNEL ||
+           pkt->path == PATH_TUN_FORWARD_TUNNEL;
+}
+
+static bool tun_pkt_sink(const pkt_t *pkt) {
+    return pkt->path == PATH_TUNNEL_ENC_FORWARD_TUN ||
+           pkt->path == PATH_TUNNEL_FORWARD_TUN;
+}
+
+static bool tunnel_pkt_outbound(const pkt_t *pkt) {
+    return pkt->path == PATH_TUNNEL_ENC_FORWARD_TUN ||
+           pkt->path == PATH_TUNNEL_FORWARD_TUN ||
+           pkt->path == PATH_TUNNEL_FORWARD_OAM;
+}
+
+static bool tunnel_pkt_sink(const pkt_t *pkt) {
+    return pkt->path == PATH_TUN_FORWARD_ENC_TUNNEL ||
+           pkt->path == PATH_TUN_FORWARD_TUNNEL ||
+           pkt->path == PATH_OAM_FORWARD_TUNNEL;
+}
+
+/* ---- node threads --------------------------------------------------- */
+
+static void *tun_node(void *arg) {
+    plane_t *pl = arg;
+    pkt_t pkt;
+    int idle = 0;
+
+    while (!pl->stop) {
+        if (chan_try_recv(pl->box.in_tun, &pkt) == CHAN_OK) {
+            if (tun_pkt_forward(&pkt))
+                mpsc_send(pl->box.in_forward, &pkt);
+            else if (tun_pkt_sink(&pkt))
+                send_done(pl, &pkt);
+            idle = 0;
+            continue;
+        }
+        if (inbox_done(pl, pl->box.in_tun)) break;
+        node_idle_one(pl, pl->box.in_tun, &idle);
     }
-    return false;
+    return NULL;
 }
 
 static void *forward_node(void *arg) {
     plane_t *pl = arg;
     pkt_t pkt;
     int idle = 0;
-    chan_t *ports[4];
-
-    ports[0] = pl->link.tun_to_forward;
-    ports[1] = pl->link.tunnel_to_forward;
-    ports[2] = pl->link.oam_to_forward;
-    ports[3] = pl->link.enc_to_forward;
 
     while (!pl->stop) {
-        if (forward_try_recv(pl, &pkt)) {
+        if (chan_try_recv(pl->box.in_forward, &pkt) == CHAN_OK) {
+            forward_route(pl, &pkt);
             idle = 0;
             continue;
         }
-        if (forward_closed(pl)) break;
-        node_idle(pl, ports, 4, &idle);
+        if (inbox_done(pl, pl->box.in_forward)) break;
+        node_idle_one(pl, pl->box.in_forward, &idle);
     }
     return NULL;
-}
-
-static void handle_enc_pkt(plane_t *pl, const pkt_t *pkt) {
-    if (pkt->path == PATH_TUN_FORWARD_ENC_TUNNEL)
-        spsc_send(pl->link.enc_to_tunnel, pkt);
-    else if (pkt->path == PATH_TUNNEL_ENC_FORWARD_TUN)
-        spsc_send(pl->link.enc_to_forward, pkt);
-}
-
-static bool enc_closed(const plane_t *pl) {
-    return chan_is_closed(pl->link.forward_to_enc) &&
-           chan_is_closed(pl->link.tunnel_to_enc);
 }
 
 static void *enc_node(void *arg) {
     plane_t *pl = arg;
     pkt_t pkt;
     int idle = 0;
-    chan_t *ports[2];
-
-    ports[0] = pl->link.forward_to_enc;
-    ports[1] = pl->link.tunnel_to_enc;
 
     while (!pl->stop) {
-        bool work = false;
-        if (chan_try_recv(pl->link.forward_to_enc, &pkt) == CHAN_OK ||
-            chan_try_recv(pl->link.tunnel_to_enc, &pkt) == CHAN_OK) {
+        if (chan_try_recv(pl->box.in_enc, &pkt) == CHAN_OK) {
             handle_enc_pkt(pl, &pkt);
-            work = true;
-        }
-        if (work) {
             idle = 0;
             continue;
         }
-        if (enc_closed(pl)) break;
-        node_idle(pl, ports, 2, &idle);
+        if (inbox_done(pl, pl->box.in_enc)) break;
+        node_idle_one(pl, pl->box.in_enc, &idle);
     }
     return NULL;
-}
-
-static void tunnel_outbound(plane_t *pl, const pkt_t *pkt) {
-    if (pkt->path == PATH_TUNNEL_ENC_FORWARD_TUN)
-        spsc_send(pl->link.tunnel_to_enc, pkt);
-    else
-        spsc_send(pl->link.tunnel_to_forward, pkt);
-}
-
-static void handle_tunnel_sink(plane_t *pl, const pkt_t *pkt) {
-    done_msg_t done = { pkt->path, pkt->seq, now_ns() };
-    spsc_send(pl->io.done_tunnel, &done);
-}
-
-static bool tunnel_closed(const plane_t *pl) {
-    return chan_is_closed(pl->io.inj_tunnel) &&
-           chan_is_closed(pl->link.enc_to_tunnel) &&
-           chan_is_closed(pl->link.forward_to_tunnel);
 }
 
 static void *tunnel_node(void *arg) {
     plane_t *pl = arg;
     pkt_t pkt;
     int idle = 0;
-    chan_t *ports[3];
-
-    ports[0] = pl->io.inj_tunnel;
-    ports[1] = pl->link.enc_to_tunnel;
-    ports[2] = pl->link.forward_to_tunnel;
 
     while (!pl->stop) {
-        bool work = false;
-        if (chan_try_recv(pl->io.inj_tunnel, &pkt) == CHAN_OK) {
-            tunnel_outbound(pl, &pkt);
-            work = true;
-        } else if (chan_try_recv(pl->link.enc_to_tunnel, &pkt) == CHAN_OK ||
-                   chan_try_recv(pl->link.forward_to_tunnel, &pkt) == CHAN_OK) {
-            handle_tunnel_sink(pl, &pkt);
-            work = true;
-        }
-        if (work) {
+        if (chan_try_recv(pl->box.in_tunnel, &pkt) == CHAN_OK) {
+            if (tunnel_pkt_outbound(&pkt))
+                tunnel_outbound(pl, &pkt);
+            else if (tunnel_pkt_sink(&pkt))
+                send_done(pl, &pkt);
             idle = 0;
             continue;
         }
-        if (tunnel_closed(pl)) break;
-        node_idle(pl, ports, 3, &idle);
+        if (inbox_done(pl, pl->box.in_tunnel)) break;
+        node_idle_one(pl, pl->box.in_tunnel, &idle);
     }
     return NULL;
-}
-
-static void handle_oam_inj(plane_t *pl, const pkt_t *pkt) {
-    spsc_send(pl->link.oam_to_forward, pkt);
-}
-
-static void handle_oam_return(plane_t *pl, const pkt_t *pkt) {
-    done_msg_t done = { pkt->path, pkt->seq, now_ns() };
-    spsc_send(pl->io.done_oam, &done);
-}
-
-static bool oam_closed(const plane_t *pl) {
-    return chan_is_closed(pl->io.inj_oam) && chan_is_closed(pl->link.forward_to_oam);
 }
 
 static void *oam_node(void *arg) {
     plane_t *pl = arg;
     pkt_t pkt;
     int idle = 0;
-    chan_t *ports[2];
-
-    ports[0] = pl->io.inj_oam;
-    ports[1] = pl->link.forward_to_oam;
 
     while (!pl->stop) {
-        bool work = false;
-        if (chan_try_recv(pl->io.inj_oam, &pkt) == CHAN_OK) {
-            handle_oam_inj(pl, &pkt);
-            work = true;
-        } else if (chan_try_recv(pl->link.forward_to_oam, &pkt) == CHAN_OK) {
-            handle_oam_return(pl, &pkt);
-            work = true;
-        }
-        if (work) {
+        if (chan_try_recv(pl->box.in_oam, &pkt) == CHAN_OK) {
+            if (pkt.path == PATH_OAM_FORWARD_TUNNEL)
+                mpsc_send(pl->box.in_forward, &pkt);
+            else if (pkt.path == PATH_TUNNEL_FORWARD_OAM)
+                send_done(pl, &pkt);
             idle = 0;
             continue;
         }
-        if (oam_closed(pl)) break;
-        node_idle(pl, ports, 2, &idle);
+        if (inbox_done(pl, pl->box.in_oam)) break;
+        node_idle_one(pl, pl->box.in_oam, &idle);
     }
     return NULL;
 }
 
-/* ---- channel setup ---------------------------------------------------- */
+/* ---- inboxes setup -------------------------------------------------- */
 
-static bool links_init(links_t *links) {
-    links->tun_to_forward    = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->forward_to_enc    = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->enc_to_tunnel     = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->tunnel_to_enc     = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->enc_to_forward    = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->forward_to_tun    = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->tunnel_to_forward = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->forward_to_oam    = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->oam_to_forward    = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    links->forward_to_tunnel = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    return links->tun_to_forward && links->forward_to_enc &&
-           links->enc_to_tunnel && links->tunnel_to_enc &&
-           links->enc_to_forward && links->forward_to_tun &&
-           links->tunnel_to_forward && links->forward_to_oam &&
-           links->oam_to_forward && links->forward_to_tunnel;
-}
-
-static bool test_io_init(test_io_t *io) {
-    io->inj_tun     = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    io->inj_tunnel  = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    io->inj_oam     = chan_create_spsc(sizeof(pkt_t), CHAN_CAP);
-    io->done_tun    = chan_create_spsc(sizeof(done_msg_t), CHAN_CAP);
-    io->done_tunnel = chan_create_spsc(sizeof(done_msg_t), CHAN_CAP);
-    io->done_oam    = chan_create_spsc(sizeof(done_msg_t), CHAN_CAP);
-    return io->inj_tun && io->inj_tunnel && io->inj_oam &&
-           io->done_tun && io->done_tunnel && io->done_oam;
+static bool inboxes_init(inboxes_t *box) {
+    box->in_tun     = chan_create(sizeof(pkt_t), CHAN_CAP);
+    box->in_forward = chan_create(sizeof(pkt_t), CHAN_CAP_HOT);
+    box->in_enc     = chan_create(sizeof(pkt_t), CHAN_CAP);
+    box->in_tunnel  = chan_create(sizeof(pkt_t), CHAN_CAP_HOT);
+    box->in_oam     = chan_create(sizeof(pkt_t), CHAN_CAP);
+    box->in_done    = chan_create(sizeof(done_msg_t), CHAN_CAP_HOT);
+    return box->in_tun && box->in_forward && box->in_enc &&
+           box->in_tunnel && box->in_oam && box->in_done;
 }
 
 static void chan_destroy_null(chan_t *ch) { if (ch) chan_destroy(ch); }
 
-static void links_destroy(links_t *links) {
-    chan_destroy_null(links->tun_to_forward);
-    chan_destroy_null(links->forward_to_enc);
-    chan_destroy_null(links->enc_to_tunnel);
-    chan_destroy_null(links->tunnel_to_enc);
-    chan_destroy_null(links->enc_to_forward);
-    chan_destroy_null(links->forward_to_tun);
-    chan_destroy_null(links->tunnel_to_forward);
-    chan_destroy_null(links->forward_to_oam);
-    chan_destroy_null(links->oam_to_forward);
-    chan_destroy_null(links->forward_to_tunnel);
-}
-
-static void test_io_destroy(test_io_t *io) {
-    chan_destroy_null(io->inj_tun);
-    chan_destroy_null(io->inj_tunnel);
-    chan_destroy_null(io->inj_oam);
-    chan_destroy_null(io->done_tun);
-    chan_destroy_null(io->done_tunnel);
-    chan_destroy_null(io->done_oam);
-}
-
-static void close_inject(test_io_t *io) {
-    chan_close(io->inj_tun);
-    chan_close(io->inj_tunnel);
-    chan_close(io->inj_oam);
+static void inboxes_destroy(inboxes_t *box) {
+    chan_destroy_null(box->in_tun);
+    chan_destroy_null(box->in_forward);
+    chan_destroy_null(box->in_enc);
+    chan_destroy_null(box->in_tunnel);
+    chan_destroy_null(box->in_oam);
+    chan_destroy_null(box->in_done);
 }
 
 static void close_all(plane_t *pl) {
     chan_t *all[] = {
-        pl->link.tun_to_forward, pl->link.forward_to_enc,
-        pl->link.enc_to_tunnel, pl->link.tunnel_to_enc,
-        pl->link.enc_to_forward, pl->link.forward_to_tun,
-        pl->link.tunnel_to_forward, pl->link.forward_to_oam,
-        pl->link.oam_to_forward, pl->link.forward_to_tunnel,
-        pl->io.inj_tun, pl->io.inj_tunnel, pl->io.inj_oam,
-        pl->io.done_tun, pl->io.done_tunnel, pl->io.done_oam,
+        pl->box.in_tun, pl->box.in_forward, pl->box.in_enc,
+        pl->box.in_tunnel, pl->box.in_oam, pl->box.in_done,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         chan_close(all[i]);
 }
 
-static chan_t *inject_ch(test_io_t *io, path_id_t path) {
+static chan_t *inject_inbox(inboxes_t *box, path_id_t path) {
     switch (path) {
     case PATH_TUN_FORWARD_ENC_TUNNEL:
-    case PATH_TUN_FORWARD_TUNNEL:    return io->inj_tun;
+    case PATH_TUN_FORWARD_TUNNEL:    return box->in_tun;
     case PATH_TUNNEL_ENC_FORWARD_TUN:
     case PATH_TUNNEL_FORWARD_TUN:
-    case PATH_TUNNEL_FORWARD_OAM:     return io->inj_tunnel;
-    case PATH_OAM_FORWARD_TUNNEL:    return io->inj_oam;
+    case PATH_TUNNEL_FORWARD_OAM:     return box->in_tunnel;
+    case PATH_OAM_FORWARD_TUNNEL:    return box->in_oam;
     default:                         return NULL;
     }
 }
@@ -835,8 +654,8 @@ static bool inject_packet(plane_t *pl, path_stat_t *stats, path_id_t path,
     uint32_t seq = (uint32_t)stats[path].sent;
     pkt_t pkt = { .seq = seq, .path = path };
     if (lat) latency_on_send(lat, path, seq);
-    chan_t *inj = inject_ch(&pl->io, path);
-    if (!spsc_send(inj, &pkt)) return false;
+    chan_t *inj = inject_inbox(&pl->box, path);
+    if (!mpsc_send(inj, &pkt)) return false;
     stats[path].sent++;
     return true;
 }
@@ -963,7 +782,6 @@ static int run_traffic(plane_t *pl, path_stat_t *stats, const run_config_t *cfg,
         rc = run_traffic_parallel(pl, stats, cfg, lat);
     if (rc != 0) return rc;
 
-    close_inject(&pl->io);
     printf("Inject done — sent %llu, draining up to %d s...\n",
            (unsigned long long)total_sent(stats), DRAIN_SEC);
     return drain_remaining(pl, stats, lat, DRAIN_SEC);
@@ -1022,32 +840,16 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "\n"
+        "  Same options as dplane_pipeline (SPSC).  Uses per-node MPSC inboxes\n"
+        "  (chan_create) instead of per-link chan_create_spsc.\n"
+        "\n"
         "  -l LIST   Comma-separated path ids 1..6 (default: all)\n"
         "  -c N      Inject N packets per enabled path (default: 1)\n"
-        "  -t SEC    Run for SEC seconds instead of -c (keeps injecting)\n"
+        "  -t SEC    Run for SEC seconds instead of -c\n"
         "  -i USEC   Microseconds between injections (default: 0)\n"
         "  -P        Parallel inject when -l selects multiple paths\n"
-        "            (default: run each path to completion, one after another)\n"
-        "  -m MODE   Node recv poll: spin | yield | backoff | block[:USEC]\n"
-        "            block default wait 100 us when all inputs empty (default: spin)\n"
-        "  -h        Show this help\n"
-        "\n"
-        "Paths:\n"
-        "  [1] tun->forward->enc->tunnel\n"
-        "  [2] tunnel->enc->forward->tun\n"
-        "  [3] tunnel->forward->tun\n"
-        "  [4] tun->forward->tunnel\n"
-        "  [5] tunnel->forward->oam\n"
-        "  [6] oam->forward->tunnel\n"
-        "\n"
-        "Verification: each packet has (path, seq).  Per path we track next_expected;\n"
-        "  seq < expected → duplicate; seq > expected → gap (loss); must end sent==recv.\n"
-        "\n"
-        "Poll modes (-m):\n"
-        "  spin     tight chan_try_recv loop (100%% CPU when idle, lowest latency)\n"
-        "  yield    sched_yield when no data on any input\n"
-        "  backoff  PAUSE/yield then 100 us sleep when idle (like multi_recv_spin)\n"
-        "  block    like backoff but final sleep is -m block:USEC (default 100 us)\n",
+        "  -m MODE   spin | yield | backoff | block[:USEC]\n"
+        "  -h        Show this help\n",
         prog);
 }
 
@@ -1136,9 +938,6 @@ static int parse_args(int argc, char **argv, run_config_t *cfg, path_stat_t *sta
             return -1;
         }
     }
-    if (cfg->duration_sec > 0 && cfg->count != 1) {
-        /* -t wins; count from default -c is ignored in timed mode */
-    }
     return 0;
 }
 
@@ -1147,7 +946,7 @@ int main(int argc, char **argv) {
     path_stat_t stats[PATH_COUNT];
     memset(stats, 0, sizeof(stats));
 
-    int pr = parse_args(argc, argv, &cfg, stats);
+    int pr = parse_args(argc, argv, &cfg, &stats);
     if (pr != 0) return pr > 0 ? 0 : 1;
 
     plane_t pl;
@@ -1155,18 +954,16 @@ int main(int argc, char **argv) {
     pl.mode = cfg.poll_mode;
     pl.block_wait_usec = cfg.block_wait_usec;
 
-    if (!links_init(&pl.link) || !test_io_init(&pl.io)) {
+    if (!inboxes_init(&pl.box)) {
         fprintf(stderr, "channel alloc failed\n");
-        links_destroy(&pl.link);
-        test_io_destroy(&pl.io);
+        inboxes_destroy(&pl.box);
         return 1;
     }
 
     latency_ctx_t lat;
     if (!latency_ctx_init(&lat, stats, &cfg)) {
         fprintf(stderr, "latency alloc failed\n");
-        links_destroy(&pl.link);
-        test_io_destroy(&pl.io);
+        inboxes_destroy(&pl.box);
         return 1;
     }
 
@@ -1178,10 +975,10 @@ int main(int argc, char **argv) {
     pthread_create(&oam_thread,     NULL, oam_node,     &pl);
 
     if (pl.mode == POLL_BLOCK)
-        printf("dplane_pipeline — SPSC data-plane (simulated), poll mode: block (wait %u us)\n",
+        printf("dplane_pipeline_mpsc — MPSC inbox data-plane, poll mode: block (wait %u us)\n",
                pl.block_wait_usec);
     else
-        printf("dplane_pipeline — SPSC data-plane (simulated), poll mode: %s\n",
+        printf("dplane_pipeline_mpsc — MPSC inbox data-plane, poll mode: %s\n",
                poll_mode_name(pl.mode));
 
     int64_t t0 = now_ns();
@@ -1199,8 +996,7 @@ int main(int argc, char **argv) {
 
     print_report(stats, &lat, elapsed);
 
-    links_destroy(&pl.link);
-    test_io_destroy(&pl.io);
+    inboxes_destroy(&pl.box);
     latency_ctx_free(&lat);
 
     if (rc != 0) return 1;
