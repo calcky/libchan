@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782814073895,
+  "lastUpdate": 1782815746770,
   "repoUrl": "https://github.com/calcky/libchan",
   "entries": {
     "libchan throughput (Mops/s)": [
@@ -586,6 +586,63 @@ window.BENCHMARK_DATA = {
           {
             "name": "9. chan MPMC 4P+4C cap=1024",
             "value": 1.34,
+            "unit": "Mops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "committer": {
+            "email": "chenkeyu@wsdashi.com",
+            "name": "chenkeyu"
+          },
+          "distinct": true,
+          "id": "976d4db5be2d658b687924d4eb997b3d2d309a98",
+          "message": "feat(examples): add burst, select fairness, RPC, and snake demos\n\nAdd burst_pipeline, select_fairness, request_reply, and snake_chan examples\nshowcasing burst I/O, select fairness, request-reply RPC, and channel-driven\nterminal input for a playable snake game.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-06-30T18:34:42+08:00",
+          "tree_id": "77b8461731a891ccb154d0a8c0be37ea79394ae1",
+          "url": "https://github.com/calcky/libchan/commit/976d4db5be2d658b687924d4eb997b3d2d309a98"
+        },
+        "date": 1782815746273,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "4. chan try_send/recv (no wait)",
+            "value": 27.23,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "5. chan MPMC cross-core steady-state (cache-coherence wall)",
+            "value": 3.16,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6. chan SPSC cross-core steady-state (cursor caching breaks the wall)",
+            "value": 11.27,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "6b. chan MPMC burst=32 cross-core steady-state (bulk amortizes the wall)",
+            "value": 94.44,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "7. chan SPSC blocking cap=1024",
+            "value": 15.98,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "8. chan unbuffered rendezvous",
+            "value": 1.42,
+            "unit": "Mops/s"
+          },
+          {
+            "name": "9. chan MPMC 4P+4C cap=1024",
+            "value": 2.65,
             "unit": "Mops/s"
           }
         ]
